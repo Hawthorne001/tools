@@ -12,22 +12,23 @@ import (
 	"go/types"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/internal/typesinternal"
 )
 
 // Diagnose computes diagnostics for switch statements with missing cases
-// overlapping with the provided start and end position.
+// overlapping with the provided start and end position of file f.
 //
-// If either start or end is invalid, the entire package is inspected.
-func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Package, info *types.Info) []analysis.Diagnostic {
+// If either start or end is invalid, the entire file is inspected.
+func Diagnose(f *ast.File, start, end token.Pos, pkg *types.Package, info *types.Info) []analysis.Diagnostic {
 	var diags []analysis.Diagnostic
-	nodeFilter := []ast.Node{(*ast.SwitchStmt)(nil), (*ast.TypeSwitchStmt)(nil)}
-	inspect.Preorder(nodeFilter, func(n ast.Node) {
+	ast.Inspect(f, func(n ast.Node) bool {
+		if n == nil {
+			return true // pop
+		}
 		if start.IsValid() && n.End() < start ||
 			end.IsValid() && n.Pos() > end {
-			return // non-overlapping
+			return false // skip non-overlapping subtree
 		}
-
 		var fix *analysis.SuggestedFix
 		switch n := n.(type) {
 		case *ast.SwitchStmt:
@@ -35,17 +36,15 @@ func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Pac
 		case *ast.TypeSwitchStmt:
 			fix = suggestedFixTypeSwitch(n, pkg, info)
 		}
-
-		if fix == nil {
-			return
+		if fix != nil {
+			diags = append(diags, analysis.Diagnostic{
+				Message:        fix.Message,
+				Pos:            n.Pos(),
+				End:            n.Pos() + token.Pos(len("switch")),
+				SuggestedFixes: []analysis.SuggestedFix{*fix},
+			})
 		}
-
-		diags = append(diags, analysis.Diagnostic{
-			Message:        fix.Message,
-			Pos:            n.Pos(),
-			End:            n.Pos() + token.Pos(len("switch")),
-			SuggestedFixes: []analysis.SuggestedFix{*fix},
-		})
+		return true
 	})
 
 	return diags
@@ -127,7 +126,7 @@ func suggestedFixTypeSwitch(stmt *ast.TypeSwitchStmt, pkg *types.Package, info *
 	}
 
 	return &analysis.SuggestedFix{
-		Message: fmt.Sprintf("Add cases for %s", namedType.Obj().Name()),
+		Message: "Add cases for " + types.TypeString(namedType, typesinternal.NameRelativeTo(pkg)),
 		TextEdits: []analysis.TextEdit{{
 			Pos:     stmt.End() - token.Pos(len("}")),
 			End:     stmt.End() - token.Pos(len("}")),
@@ -178,7 +177,7 @@ func suggestedFixSwitch(stmt *ast.SwitchStmt, pkg *types.Package, info *types.In
 	addDefaultCase(&buf, namedType, stmt.Tag)
 
 	return &analysis.SuggestedFix{
-		Message: fmt.Sprintf("Add cases for %s", namedType.Obj().Name()),
+		Message: "Add cases for " + types.TypeString(namedType, typesinternal.NameRelativeTo(pkg)),
 		TextEdits: []analysis.TextEdit{{
 			Pos:     stmt.End() - token.Pos(len("}")),
 			End:     stmt.End() - token.Pos(len("}")),

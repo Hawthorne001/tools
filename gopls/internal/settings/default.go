@@ -21,11 +21,13 @@ var (
 // DefaultOptions is the options that are used for Gopls execution independent
 // of any externally provided configuration (LSP initialization, command
 // invocation, etc.).
+//
+// It is the source from which gopls/doc/settings.md is generated.
 func DefaultOptions(overrides ...func(*Options)) *Options {
 	optionsOnce.Do(func() {
 		var commands []string
 		for _, c := range command.Commands {
-			commands = append(commands, c.ID())
+			commands = append(commands, c.String())
 		}
 		defaultOptions = &Options{
 			ClientOptions: ClientOptions{
@@ -37,17 +39,37 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 				DynamicWatchedFilesSupported:               true,
 				LineFoldingOnly:                            false,
 				HierarchicalDocumentSymbolSupport:          true,
+				ImportsSource:                              ImportsSourceGopls,
 			},
 			ServerOptions: ServerOptions{
 				SupportedCodeActions: map[file.Kind]map[protocol.CodeActionKind]bool{
 					file.Go: {
-						protocol.SourceFixAll:          true,
-						protocol.SourceOrganizeImports: true,
-						protocol.QuickFix:              true,
-						protocol.RefactorRewrite:       true,
-						protocol.RefactorInline:        true,
-						protocol.RefactorExtract:       true,
-						protocol.GoDoc:                 true,
+						// This should include specific leaves in the tree,
+						// (e.g. refactor.inline.call) not generic branches
+						// (e.g. refactor.inline or refactor).
+						protocol.SourceFixAll:            true,
+						protocol.SourceOrganizeImports:   true,
+						protocol.QuickFix:                true,
+						GoAssembly:                       true,
+						GoDoc:                            true,
+						GoFreeSymbols:                    true,
+						GoplsDocFeatures:                 true,
+						RefactorRewriteChangeQuote:       true,
+						RefactorRewriteFillStruct:        true,
+						RefactorRewriteFillSwitch:        true,
+						RefactorRewriteInvertIf:          true,
+						RefactorRewriteJoinLines:         true,
+						RefactorRewriteRemoveUnusedParam: true,
+						RefactorRewriteSplitLines:        true,
+						RefactorInlineCall:               true,
+						RefactorExtractConstant:          true,
+						RefactorExtractConstantAll:       true,
+						RefactorExtractFunction:          true,
+						RefactorExtractMethod:            true,
+						RefactorExtractVariable:          true,
+						RefactorExtractVariableAll:       true,
+						RefactorExtractToNewFile:         true,
+						// Not GoTest: it must be explicit in CodeActionParams.Context.Only
 					},
 					file.Mod: {
 						protocol.SourceOrganizeImports: true,
@@ -68,12 +90,6 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 				},
 				UIOptions: UIOptions{
 					DiagnosticOptions: DiagnosticOptions{
-						Annotations: map[Annotation]bool{
-							Bounds: true,
-							Escape: true,
-							Inline: true,
-							Nil:    true,
-						},
 						Vulncheck:                 ModeVulncheckOff,
 						DiagnosticsDelay:          1 * time.Second,
 						DiagnosticsTrigger:        DiagnosticsOnEdit,
@@ -83,7 +99,7 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 					DocumentationOptions: DocumentationOptions{
 						HoverKind:    FullDocumentation,
 						LinkTarget:   "pkg.go.dev",
-						LinksInHover: true,
+						LinksInHover: LinksInHover_LinkTarget,
 					},
 					NavigationOptions: NavigationOptions{
 						ImportShortcut: BothShortcuts,
@@ -97,14 +113,13 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 						ExperimentalPostfixCompletions: true,
 						CompleteFunctionCalls:          true,
 					},
-					Codelenses: map[string]bool{
-						string(command.Generate):          true,
-						string(command.RegenerateCgo):     true,
-						string(command.Tidy):              true,
-						string(command.GCDetails):         false,
-						string(command.UpgradeDependency): true,
-						string(command.Vendor):            true,
-						// TODO(hyangah): enable command.RunGovulncheck.
+					Codelenses: map[CodeLensSource]bool{
+						CodeLensGenerate:          true,
+						CodeLensRegenerateCgo:     true,
+						CodeLensTidy:              true,
+						CodeLensUpgradeDependency: true,
+						CodeLensVendor:            true,
+						CodeLensRunGovulncheck:    false, // TODO(hyangah): enable
 					},
 				},
 			},
@@ -118,11 +133,6 @@ func DefaultOptions(overrides ...func(*Options)) *Options {
 				LinkifyShowMessage:          false,
 				IncludeReplaceInWorkspace:   false,
 				ZeroConfig:                  true,
-			},
-			Hooks: Hooks{
-				URLRegexp:            urlRegexp(),
-				DefaultAnalyzers:     analyzers(),
-				StaticcheckAnalyzers: map[string]*Analyzer{},
 			},
 		}
 	})

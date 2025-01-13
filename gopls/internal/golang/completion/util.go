@@ -13,7 +13,6 @@ import (
 	"golang.org/x/tools/gopls/internal/golang"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/typeparams"
 )
@@ -65,7 +64,7 @@ func eachField(T types.Type, fn func(*types.Var)) {
 func typeIsValid(typ types.Type) bool {
 	// Check named types separately, because we don't want
 	// to call Underlying() on them to avoid problems with recursive types.
-	if _, ok := aliases.Unalias(typ).(*types.Named); ok {
+	if _, ok := types.Unalias(typ).(*types.Named); ok {
 		return true
 	}
 
@@ -140,16 +139,23 @@ func isPkgName(obj types.Object) bool  { return is[*types.PkgName](obj) }
 // It returns false for a Named type whose Underlying is a Pointer.
 //
 // TODO(adonovan): shouldn't this use CoreType(T)?
-func isPointer(T types.Type) bool { return is[*types.Pointer](aliases.Unalias(T)) }
+func isPointer(T types.Type) bool { return is[*types.Pointer](types.Unalias(T)) }
 
+// isEmptyInterface whether T is a (possibly Named or Alias) empty interface
+// type, such that every type is assignable to T.
+//
+// isEmptyInterface returns false for type parameters, since they have
+// different assignability rules.
 func isEmptyInterface(T types.Type) bool {
-	// TODO(adonovan): shouldn't this use Underlying?
-	intf, _ := T.(*types.Interface)
-	return intf != nil && intf.NumMethods() == 0 && intf.IsMethodSet()
+	if _, ok := T.(*types.TypeParam); ok {
+		return false
+	}
+	intf, _ := T.Underlying().(*types.Interface)
+	return intf != nil && intf.Empty()
 }
 
 func isUntyped(T types.Type) bool {
-	if basic, ok := aliases.Unalias(T).(*types.Basic); ok {
+	if basic, ok := types.Unalias(T).(*types.Basic); ok {
 		return basic.Info()&types.IsUntyped > 0
 	}
 	return false
@@ -271,28 +277,6 @@ func prevStmt(pos token.Pos, path []ast.Node) ast.Stmt {
 	return nil
 }
 
-// formatZeroValue produces Go code representing the zero value of T. It
-// returns the empty string if T is invalid.
-func formatZeroValue(T types.Type, qf types.Qualifier) string {
-	switch u := T.Underlying().(type) {
-	case *types.Basic:
-		switch {
-		case u.Info()&types.IsNumeric > 0:
-			return "0"
-		case u.Info()&types.IsString > 0:
-			return `""`
-		case u.Info()&types.IsBoolean > 0:
-			return "false"
-		default:
-			return ""
-		}
-	case *types.Pointer, *types.Interface, *types.Chan, *types.Map, *types.Slice, *types.Signature:
-		return "nil"
-	default:
-		return types.TypeString(T, qf) + "{}"
-	}
-}
-
 // isBasicKind returns whether t is a basic type of kind k.
 func isBasicKind(t types.Type, k types.BasicInfo) bool {
 	b, _ := t.Underlying().(*types.Basic)
@@ -314,8 +298,8 @@ func (c *completer) editText(from, to token.Pos, newText string) ([]protocol.Tex
 // assignableTo is like types.AssignableTo, but returns false if
 // either type is invalid.
 func assignableTo(x, to types.Type) bool {
-	if aliases.Unalias(x) == types.Typ[types.Invalid] ||
-		aliases.Unalias(to) == types.Typ[types.Invalid] {
+	if types.Unalias(x) == types.Typ[types.Invalid] ||
+		types.Unalias(to) == types.Typ[types.Invalid] {
 		return false
 	}
 
@@ -325,8 +309,8 @@ func assignableTo(x, to types.Type) bool {
 // convertibleTo is like types.ConvertibleTo, but returns false if
 // either type is invalid.
 func convertibleTo(x, to types.Type) bool {
-	if aliases.Unalias(x) == types.Typ[types.Invalid] ||
-		aliases.Unalias(to) == types.Typ[types.Invalid] {
+	if types.Unalias(x) == types.Typ[types.Invalid] ||
+		types.Unalias(to) == types.Typ[types.Invalid] {
 		return false
 	}
 

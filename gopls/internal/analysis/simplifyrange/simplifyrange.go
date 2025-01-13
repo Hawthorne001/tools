@@ -29,18 +29,27 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	// Gather information whether file is generated or not
+	generated := make(map[*token.File]bool)
+	for _, file := range pass.Files {
+		if ast.IsGenerated(file) {
+			generated[pass.Fset.File(file.FileStart)] = true
+		}
+	}
+
 	inspect := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	nodeFilter := []ast.Node{
 		(*ast.RangeStmt)(nil),
 	}
 	inspect.Preorder(nodeFilter, func(n ast.Node) {
-		var copy *ast.RangeStmt
-		if stmt, ok := n.(*ast.RangeStmt); ok {
-			x := *stmt
-			copy = &x
+		if _, ok := generated[pass.Fset.File(n.Pos())]; ok {
+			return // skip checking if it's generated code
 		}
-		if copy == nil {
-			return
+
+		var copy *ast.RangeStmt // shallow-copy the AST before modifying
+		{
+			x := *n.(*ast.RangeStmt)
+			copy = &x
 		}
 		end := newlineIndex(pass.Fset, copy)
 

@@ -5,9 +5,11 @@
 package cache
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 
+	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/bug"
 )
@@ -49,13 +51,13 @@ type Diagnostic struct {
 	Tags    []protocol.DiagnosticTag
 	Related []protocol.DiagnosticRelatedInformation
 
-	// Fields below are used internally to generate quick fixes. They aren't
+	// Fields below are used internally to generate lazy fixes. They aren't
 	// part of the LSP spec and historically didn't leave the server.
 	//
 	// Update(2023-05): version 3.16 of the LSP spec included support for the
 	// Diagnostic.data field, which holds arbitrary data preserved in the
 	// diagnostic for codeAction requests. This field allows bundling additional
-	// information for quick-fixes, and gopls can (and should) use this
+	// information for lazy fixes, and gopls can (and should) use this
 	// information to avoid re-evaluating diagnostics in code-action handlers.
 	//
 	// In order to stage this transition incrementally, the 'BundledFixes' field
@@ -69,21 +71,48 @@ func (d *Diagnostic) String() string {
 	return fmt.Sprintf("%v: %s", d.Range, d.Message)
 }
 
+// Hash computes a hash to identify the diagnostic.
+// The hash is for deduplicating within a file, so does not incorporate d.URI.
+func (d *Diagnostic) Hash() file.Hash {
+	h := sha256.New()
+	for _, t := range d.Tags {
+		fmt.Fprintf(h, "tag: %s\n", t)
+	}
+	for _, r := range d.Related {
+		fmt.Fprintf(h, "related: %s %s %s\n", r.Location.URI, r.Message, r.Location.Range)
+	}
+	fmt.Fprintf(h, "code: %s\n", d.Code)
+	fmt.Fprintf(h, "codeHref: %s\n", d.CodeHref)
+	fmt.Fprintf(h, "message: %s\n", d.Message)
+	fmt.Fprintf(h, "range: %s\n", d.Range)
+	fmt.Fprintf(h, "severity: %s\n", d.Severity)
+	fmt.Fprintf(h, "source: %s\n", d.Source)
+	if d.BundledFixes != nil {
+		fmt.Fprintf(h, "fixes: %s\n", *d.BundledFixes)
+	}
+	var hash [sha256.Size]byte
+	h.Sum(hash[:0])
+	return hash
+}
+
+// A DiagnosticSource identifies the source of a diagnostic.
+//
+// Its value may be one of the distinguished string values below, or
+// the Name of an [analysis.Analyzer].
 type DiagnosticSource string
 
 const (
-	UnknownError             DiagnosticSource = "<Unknown source>"
-	ListError                DiagnosticSource = "go list"
-	ParseError               DiagnosticSource = "syntax"
-	TypeError                DiagnosticSource = "compiler"
-	ModTidyError             DiagnosticSource = "go mod tidy"
-	OptimizationDetailsError DiagnosticSource = "optimizer details"
-	UpgradeNotification      DiagnosticSource = "upgrade available"
-	Vulncheck                DiagnosticSource = "vulncheck imports"
-	Govulncheck              DiagnosticSource = "govulncheck"
-	TemplateError            DiagnosticSource = "template"
-	WorkFileError            DiagnosticSource = "go.work file"
-	ConsistencyInfo          DiagnosticSource = "consistency"
+	UnknownError           DiagnosticSource = "<Unknown source>"
+	ListError              DiagnosticSource = "go list"
+	ParseError             DiagnosticSource = "syntax"
+	TypeError              DiagnosticSource = "compiler"
+	ModTidyError           DiagnosticSource = "go mod tidy"
+	CompilerOptDetailsInfo DiagnosticSource = "optimizer details" // cmd/compile -json=0,dir
+	UpgradeNotification    DiagnosticSource = "upgrade available"
+	Vulncheck              DiagnosticSource = "vulncheck imports"
+	Govulncheck            DiagnosticSource = "govulncheck"
+	TemplateError          DiagnosticSource = "template"
+	WorkFileError          DiagnosticSource = "go.work file"
 )
 
 // A SuggestedFix represents a suggested fix (for a diagnostic)
@@ -103,26 +132,28 @@ type SuggestedFix struct {
 }
 
 // SuggestedFixFromCommand returns a suggested fix to run the given command.
-func SuggestedFixFromCommand(cmd protocol.Command, kind protocol.CodeActionKind) SuggestedFix {
+func SuggestedFixFromCommand(cmd *protocol.Command, kind protocol.CodeActionKind) SuggestedFix {
 	return SuggestedFix{
 		Title:      cmd.Title,
-		Command:    &cmd,
+		Command:    cmd,
 		ActionKind: kind,
 	}
 }
 
-// quickFixesJSON is a JSON-serializable list of quick fixes
-// to be saved in the protocol.Diagnostic.Data field.
-type quickFixesJSON struct {
+// lazyFixesJSON is a JSON-serializable list of code actions (arising
+// from "lazy" SuggestedFixes with no Edits) to be saved in the
+// protocol.Diagnostic.Data field. Computation of the edits is thus
+// deferred until the action's command is invoked.
+type lazyFixesJSON struct {
 	// TODO(rfindley): pack some sort of identifier here for later
 	// lookup/validation?
-	Fixes []protocol.CodeAction
+	Actions []protocol.CodeAction
 }
 
-// bundleQuickFixes attempts to bundle sd.SuggestedFixes into the
+// bundleLazyFixes attempts to bundle sd.SuggestedFixes into the
 // sd.BundledFixes field, so that it can be round-tripped through the client.
-// It returns false if the quick-fixes cannot be bundled.
-func bundleQuickFixes(sd *Diagnostic) bool {
+// It returns false if the fixes cannot be bundled.
+func bundleLazyFixes(sd *Diagnostic) bool {
 	if len(sd.SuggestedFixes) == 0 {
 		return true
 	}
@@ -148,12 +179,12 @@ func bundleQuickFixes(sd *Diagnostic) bool {
 		}
 		actions = append(actions, action)
 	}
-	fixes := quickFixesJSON{
-		Fixes: actions,
+	fixes := lazyFixesJSON{
+		Actions: actions,
 	}
 	data, err := json.Marshal(fixes)
 	if err != nil {
-		bug.Reportf("marshalling quick fixes: %v", err)
+		bug.Reportf("marshalling lazy fixes: %v", err)
 		return false
 	}
 	msg := json.RawMessage(data)
@@ -161,24 +192,22 @@ func bundleQuickFixes(sd *Diagnostic) bool {
 	return true
 }
 
-// BundledQuickFixes extracts any bundled codeActions from the
+// BundledLazyFixes extracts any bundled codeActions from the
 // diag.Data field.
-func BundledQuickFixes(diag protocol.Diagnostic) []protocol.CodeAction {
-	var fix quickFixesJSON
+func BundledLazyFixes(diag protocol.Diagnostic) ([]protocol.CodeAction, error) {
+	var fix lazyFixesJSON
 	if diag.Data != nil {
 		err := protocol.UnmarshalJSON(*diag.Data, &fix)
 		if err != nil {
-			bug.Reportf("unmarshalling quick fix: %v", err)
-			return nil
+			return nil, fmt.Errorf("unmarshalling fix from diagnostic data: %v", err)
 		}
 	}
 
 	var actions []protocol.CodeAction
-	for _, action := range fix.Fixes {
-		// See BundleQuickFixes: for now we only support bundling commands.
+	for _, action := range fix.Actions {
+		// See bundleLazyFixes: for now we only support bundling commands.
 		if action.Edit != nil {
-			bug.Reportf("bundled fix %q includes workspace edits", action.Title)
-			continue
+			return nil, fmt.Errorf("bundled fix %q includes workspace edits", action.Title)
 		}
 		// associate the action with the incoming diagnostic
 		// (Note that this does not mutate the fix.Fixes slice).
@@ -186,5 +215,5 @@ func BundledQuickFixes(diag protocol.Diagnostic) []protocol.CodeAction {
 		actions = append(actions, action)
 	}
 
-	return actions
+	return actions, nil
 }

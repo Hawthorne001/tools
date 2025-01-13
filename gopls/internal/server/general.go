@@ -10,9 +10,9 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"go/build"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -23,12 +23,13 @@ import (
 	"golang.org/x/telemetry/counter"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/debug"
+	debuglog "golang.org/x/tools/gopls/internal/debug/log"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/goversion"
-	"golang.org/x/tools/gopls/internal/util/maps"
+	"golang.org/x/tools/gopls/internal/util/moremaps"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/jsonrpc2"
 )
@@ -68,13 +69,10 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 	s.progress.SetSupportsWorkDoneProgress(params.Capabilities.Window.WorkDoneProgress)
 
 	options := s.Options().Clone()
-	// TODO(rfindley): remove the error return from handleOptionResults, and
-	// eliminate this defer.
+	// TODO(rfindley): eliminate this defer.
 	defer func() { s.SetOptions(options) }()
 
-	if err := s.handleOptionResults(ctx, settings.SetOptions(options, params.InitializationOptions)); err != nil {
-		return nil, err
-	}
+	s.handleOptionErrors(ctx, options.Set(params.InitializationOptions))
 	options.ForClientCapabilities(params.ClientInfo, params.Capabilities)
 
 	if options.ShowBugReports {
@@ -84,11 +82,7 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 				Type:    protocol.Error,
 				Message: fmt.Sprintf("A bug occurred on the server: %s\nLocation:%s", b.Description, b.Key),
 			}
-			go func() {
-				if err := s.eventuallyShowMessage(context.Background(), msg); err != nil {
-					log.Printf("error showing bug: %v", err)
-				}
-			}()
+			go s.eventuallyShowMessage(context.Background(), msg)
 		})
 	}
 
@@ -101,15 +95,7 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 			}}
 		}
 	}
-	for _, folder := range folders {
-		if folder.URI == "" {
-			return nil, fmt.Errorf("empty WorkspaceFolder.URI")
-		}
-		if _, err := protocol.ParseDocumentURI(folder.URI); err != nil {
-			return nil, fmt.Errorf("invalid WorkspaceFolder.URI: %v", err)
-		}
-		s.pendingFolders = append(s.pendingFolders, folder)
-	}
+	s.pendingFolders = append(s.pendingFolders, folders...)
 
 	var codeActionProvider interface{} = true
 	if ca := params.Capabilities.TextDocument.CodeAction; len(ca.CodeActionLiteralSupport.CodeActionKind.ValueSet) > 0 {
@@ -122,6 +108,17 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 			ResolveProvider: true,
 		}
 	}
+
+	var diagnosticProvider *protocol.Or_ServerCapabilities_diagnosticProvider
+	if options.PullDiagnostics {
+		diagnosticProvider = &protocol.Or_ServerCapabilities_diagnosticProvider{
+			Value: protocol.DiagnosticOptions{
+				InterFileDependencies: true,
+				WorkspaceDiagnostics:  false, // we don't support workspace/diagnostic
+			},
+		}
+	}
+
 	var renameOpts interface{} = true
 	if r := params.Capabilities.TextDocument.Rename; r != nil && r.PrepareSupport {
 		renameOpts = protocol.RenameOptions{
@@ -158,6 +155,7 @@ func (s *server) Initialize(ctx context.Context, params *protocol.ParamInitializ
 			DocumentHighlightProvider: &protocol.Or_ServerCapabilities_documentHighlightProvider{Value: true},
 			DocumentLinkProvider:      &protocol.DocumentLinkOptions{},
 			InlayHintProvider:         protocol.InlayHintOptions{},
+			DiagnosticProvider:        diagnosticProvider,
 			ReferencesProvider:        &protocol.Or_ServerCapabilities_referencesProvider{Value: true},
 			RenameProvider:            renameOpts,
 			SelectionRangeProvider:    &protocol.Or_ServerCapabilities_selectionRangeProvider{Value: true},
@@ -284,10 +282,27 @@ func go1Point() int {
 // addFolders adds the specified list of "folders" (that's Windows for
 // directories) to the session. It does not return an error, though it
 // may report an error to the client over LSP if one or more folders
-// had problems.
+// had problems, for example, folders with unsupported file system.
 func (s *server) addFolders(ctx context.Context, folders []protocol.WorkspaceFolder) {
 	originalViews := len(s.session.Views())
 	viewErrors := make(map[protocol.URI]error)
+
+	// Skip non-'file' scheme, or invalid workspace folders,
+	// and log them form error reports.
+	// VS Code's file system API
+	// (https://code.visualstudio.com/api/references/vscode-api#FileSystem)
+	// allows extension to define their own schemes and register
+	// them with the workspace. We've seen gitlens://, decompileFs://, etc
+	// but the list can grow over time.
+	var filtered []protocol.WorkspaceFolder
+	for _, f := range folders {
+		if _, err := protocol.ParseDocumentURI(f.URI); err != nil {
+			debuglog.Warning.Logf(ctx, "skip adding virtual folder %q - invalid folder URI: %v", f.Name, err)
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+	folders = filtered
 
 	var ndiagnose sync.WaitGroup // number of unfinished diagnose calls
 	if s.Options().VerboseWorkDoneProgress {
@@ -332,7 +347,7 @@ func (s *server) addFolders(ctx context.Context, folders []protocol.WorkspaceFol
 		// Diagnose the newly created view asynchronously.
 		ndiagnose.Add(1)
 		go func() {
-			s.diagnoseSnapshot(snapshot, nil, 0)
+			s.diagnoseSnapshot(snapshot.BackgroundContext(), snapshot, nil, 0)
 			<-initialized
 			release()
 			ndiagnose.Done()
@@ -369,7 +384,7 @@ func (s *server) updateWatchedDirectories(ctx context.Context) error {
 	defer s.watchedGlobPatternsMu.Unlock()
 
 	// Nothing to do if the set of workspace directories is unchanged.
-	if maps.SameKeys(s.watchedGlobPatterns, patterns) {
+	if moremaps.SameKeys(s.watchedGlobPatterns, patterns) {
 		return nil
 	}
 
@@ -460,38 +475,40 @@ func (s *server) SetOptions(opts *settings.Options) {
 	s.options = opts
 }
 
-func (s *server) newFolder(ctx context.Context, folder protocol.DocumentURI, name string) (*cache.Folder, error) {
-	opts := s.Options()
-	if opts.ConfigurationSupported {
-		scope := string(folder)
-		configs, err := s.client.Configuration(ctx, &protocol.ParamConfiguration{
-			Items: []protocol.ConfigurationItem{{
-				ScopeURI: &scope,
-				Section:  "gopls",
-			}},
-		},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get workspace configuration from client (%s): %v", folder, err)
-		}
-
-		opts = opts.Clone()
-		for _, config := range configs {
-			if err := s.handleOptionResults(ctx, settings.SetOptions(opts, config)); err != nil {
-				return nil, err
-			}
-		}
-	}
-
+func (s *server) newFolder(ctx context.Context, folder protocol.DocumentURI, name string, opts *settings.Options) (*cache.Folder, error) {
 	env, err := cache.FetchGoEnv(ctx, folder, opts)
 	if err != nil {
 		return nil, err
 	}
+
+	// Increment folder counters.
+	switch {
+	case env.GOTOOLCHAIN == "auto" || strings.Contains(env.GOTOOLCHAIN, "+auto"):
+		counter.Inc("gopls/gotoolchain:auto")
+	case env.GOTOOLCHAIN == "path" || strings.Contains(env.GOTOOLCHAIN, "+path"):
+		counter.Inc("gopls/gotoolchain:path")
+	case env.GOTOOLCHAIN == "local": // local+auto and local+path handled above
+		counter.Inc("gopls/gotoolchain:local")
+	default:
+		counter.Inc("gopls/gotoolchain:other")
+	}
+
+	// Record whether a driver is in use so that it appears in the
+	// user's telemetry upload. Although we can't correlate the
+	// driver information with the crash or bug.Report at the
+	// granularity of the process instance, users that use a
+	// driver tend to do so most of the time, so we'll get a
+	// strong clue. See #60890 for an example of an issue where
+	// this information would have been helpful.
+	if env.EffectiveGOPACKAGESDRIVER != "" {
+		counter.Inc("gopls/gopackagesdriver")
+	}
+
 	return &cache.Folder{
 		Dir:     folder,
 		Name:    name,
 		Options: opts,
-		Env:     env,
+		Env:     *env,
 	}, nil
 }
 
@@ -522,33 +539,30 @@ func (s *server) fetchFolderOptions(ctx context.Context, folder protocol.Documen
 
 	opts = opts.Clone()
 	for _, config := range configs {
-		if err := s.handleOptionResults(ctx, settings.SetOptions(opts, config)); err != nil {
-			return nil, err
-		}
+		s.handleOptionErrors(ctx, opts.Set(config))
 	}
 	return opts, nil
 }
 
-func (s *server) eventuallyShowMessage(ctx context.Context, msg *protocol.ShowMessageParams) error {
+func (s *server) eventuallyShowMessage(ctx context.Context, msg *protocol.ShowMessageParams) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	if s.state == serverInitialized {
-		return s.client.ShowMessage(ctx, msg)
+		_ = s.client.ShowMessage(ctx, msg) // ignore error
 	}
 	s.notifications = append(s.notifications, msg)
-	return nil
 }
 
-func (s *server) handleOptionResults(ctx context.Context, results settings.OptionResults) error {
-	var warnings, errors []string
-	for _, result := range results {
-		switch result.Error.(type) {
-		case nil:
-			// nothing to do
-		case *settings.SoftError:
-			warnings = append(warnings, result.Error.Error())
-		default:
-			errors = append(errors, result.Error.Error())
+func (s *server) handleOptionErrors(ctx context.Context, optionErrors []error) {
+	var warnings, errs []string
+	for _, err := range optionErrors {
+		if err == nil {
+			panic("nil error passed to handleOptionErrors")
+		}
+		if errors.Is(err, new(settings.SoftError)) {
+			warnings = append(warnings, err.Error())
+		} else {
+			errs = append(errs, err.Error())
 		}
 	}
 
@@ -560,10 +574,10 @@ func (s *server) handleOptionResults(ctx context.Context, results settings.Optio
 	// individual viewsettings.
 	var msgs []string
 	msgType := protocol.Warning
-	if len(errors) > 0 {
+	if len(errs) > 0 {
 		msgType = protocol.Error
-		sort.Strings(errors)
-		msgs = append(msgs, errors...)
+		sort.Strings(errs)
+		msgs = append(msgs, errs...)
 	}
 	if len(warnings) > 0 {
 		sort.Strings(warnings)
@@ -577,10 +591,8 @@ func (s *server) handleOptionResults(ctx context.Context, results settings.Optio
 			Type:    msgType,
 			Message: combined,
 		}
-		return s.eventuallyShowMessage(ctx, params)
+		s.eventuallyShowMessage(ctx, params)
 	}
-
-	return nil
 }
 
 // fileOf returns the file for a given URI and its snapshot.
@@ -598,7 +610,7 @@ func (s *server) fileOf(ctx context.Context, uri protocol.DocumentURI) (file.Han
 	return fh, snapshot, release, nil
 }
 
-// shutdown implements the 'shutdown' LSP handler. It releases resources
+// Shutdown implements the 'shutdown' LSP handler. It releases resources
 // associated with the server and waits for all ongoing work to complete.
 func (s *server) Shutdown(ctx context.Context) error {
 	ctx, done := event.Start(ctx, "lsp.Server.shutdown")

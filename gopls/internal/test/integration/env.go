@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/tools/gopls/internal/protocol"
@@ -34,6 +35,10 @@ type Env struct {
 	Awaiter *Awaiter
 }
 
+// nextAwaiterRegistration is used to create unique IDs for various Awaiter
+// registrations.
+var nextAwaiterRegistration atomic.Uint64
+
 // An Awaiter keeps track of relevant LSP state, so that it may be asserted
 // upon with Expectations.
 //
@@ -46,19 +51,25 @@ type Awaiter struct {
 
 	mu sync.Mutex
 	// For simplicity, each waiter gets a unique ID.
-	nextWaiterID int
-	state        State
-	waiters      map[int]*condition
+	state   State
+	waiters map[uint64]*condition
+
+	// collectors map a registration to the collection of messages that have been
+	// received since the registration was created.
+	docCollectors     map[uint64][]*protocol.ShowDocumentParams
+	messageCollectors map[uint64][]*protocol.ShowMessageParams
 }
 
 func NewAwaiter(workdir *fake.Workdir) *Awaiter {
 	return &Awaiter{
 		workdir: workdir,
 		state: State{
-			diagnostics: make(map[string]*protocol.PublishDiagnosticsParams),
-			work:        make(map[protocol.ProgressToken]*workProgress),
+			diagnostics:   make(map[string]*protocol.PublishDiagnosticsParams),
+			work:          make(map[protocol.ProgressToken]*workProgress),
+			startedWork:   make(map[string]uint64),
+			completedWork: make(map[string]uint64),
 		},
-		waiters: make(map[int]*condition),
+		waiters: make(map[uint64]*condition),
 	}
 }
 
@@ -74,7 +85,6 @@ func (a *Awaiter) Hooks() fake.ClientHooks {
 		OnShowMessageRequest:     a.onShowMessageRequest,
 		OnRegisterCapability:     a.onRegisterCapability,
 		OnUnregisterCapability:   a.onUnregisterCapability,
-		OnApplyEdit:              a.onApplyEdit,
 	}
 }
 
@@ -90,38 +100,18 @@ type State struct {
 	registrations          []*protocol.RegistrationParams
 	registeredCapabilities map[string]protocol.Registration
 	unregistrations        []*protocol.UnregistrationParams
-	documentChanges        []protocol.DocumentChanges // collected from ApplyEdit downcalls
 
 	// outstandingWork is a map of token->work summary. All tokens are assumed to
-	// be string, though the spec allows for numeric tokens as well.  When work
-	// completes, it is deleted from this map.
-	work map[protocol.ProgressToken]*workProgress
-}
-
-// completedWork counts complete work items by title.
-func (s State) completedWork() map[string]uint64 {
-	completed := make(map[string]uint64)
-	for _, work := range s.work {
-		if work.complete {
-			completed[work.title]++
-		}
-	}
-	return completed
-}
-
-// startedWork counts started (and possibly complete) work items.
-func (s State) startedWork() map[string]uint64 {
-	started := make(map[string]uint64)
-	for _, work := range s.work {
-		started[work.title]++
-	}
-	return started
+	// be string, though the spec allows for numeric tokens as well.
+	work          map[protocol.ProgressToken]*workProgress
+	startedWork   map[string]uint64 // title -> count of 'begin'
+	completedWork map[string]uint64 // title -> count of 'end'
 }
 
 type workProgress struct {
 	title, msg, endMsg string
 	percent            float64
-	complete           bool // seen 'end'.
+	complete           bool // seen 'end'
 }
 
 // This method, provided for debugging, accesses mutable fields without a lock,
@@ -159,7 +149,7 @@ func (s State) String() string {
 		fmt.Fprintf(&b, "\t%s: %.2f\n", name, state.percent)
 	}
 	b.WriteString("#### completed work:\n")
-	for name, count := range s.completedWork() {
+	for name, count := range s.completedWork {
 		fmt.Fprintf(&b, "\t%s: %d\n", name, count)
 	}
 	return b.String()
@@ -171,15 +161,6 @@ func (s State) String() string {
 type condition struct {
 	expectations []Expectation
 	verdict      chan Verdict
-}
-
-func (a *Awaiter) onApplyEdit(_ context.Context, params *protocol.ApplyWorkspaceEditParams) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.state.documentChanges = append(a.state.documentChanges, params.Edit.DocumentChanges...)
-	a.checkConditionsLocked()
-	return nil
 }
 
 func (a *Awaiter) onDiagnostics(_ context.Context, d *protocol.PublishDiagnosticsParams) error {
@@ -196,18 +177,76 @@ func (a *Awaiter) onShowDocument(_ context.Context, params *protocol.ShowDocumen
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Update any outstanding listeners.
+	for id, s := range a.docCollectors {
+		a.docCollectors[id] = append(s, params)
+	}
+
 	a.state.showDocument = append(a.state.showDocument, params)
 	a.checkConditionsLocked()
 	return nil
 }
 
-func (a *Awaiter) onShowMessage(_ context.Context, m *protocol.ShowMessageParams) error {
+// ListenToShownDocuments registers a listener to incoming showDocument
+// notifications. Call the resulting func to deregister the listener and
+// receive all notifications that have occurred since the listener was
+// registered.
+func (a *Awaiter) ListenToShownDocuments() func() []*protocol.ShowDocumentParams {
+	id := nextAwaiterRegistration.Add(1)
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.state.showMessage = append(a.state.showMessage, m)
+	if a.docCollectors == nil {
+		a.docCollectors = make(map[uint64][]*protocol.ShowDocumentParams)
+	}
+	a.docCollectors[id] = nil
+
+	return func() []*protocol.ShowDocumentParams {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		params := a.docCollectors[id]
+		delete(a.docCollectors, id)
+		return params
+	}
+}
+
+func (a *Awaiter) onShowMessage(_ context.Context, params *protocol.ShowMessageParams) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Update any outstanding listeners.
+	for id, s := range a.messageCollectors {
+		a.messageCollectors[id] = append(s, params)
+	}
+
+	a.state.showMessage = append(a.state.showMessage, params)
 	a.checkConditionsLocked()
 	return nil
+}
+
+// ListenToShownMessages registers a listener to incoming showMessage
+// notifications. Call the resulting func to deregister the listener and
+// receive all notifications that have occurred since the listener was
+// registered.
+func (a *Awaiter) ListenToShownMessages() func() []*protocol.ShowMessageParams {
+	id := nextAwaiterRegistration.Add(1)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.messageCollectors == nil {
+		a.messageCollectors = make(map[uint64][]*protocol.ShowMessageParams)
+	}
+	a.messageCollectors[id] = nil
+
+	return func() []*protocol.ShowMessageParams {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		params := a.messageCollectors[id]
+		delete(a.messageCollectors, id)
+		return params
+	}
 }
 
 func (a *Awaiter) onShowMessageRequest(_ context.Context, m *protocol.ShowMessageRequestParams) error {
@@ -247,6 +286,7 @@ func (a *Awaiter) onProgress(_ context.Context, m *protocol.ProgressParams) erro
 	switch kind := v["kind"]; kind {
 	case "begin":
 		work.title = v["title"].(string)
+		a.state.startedWork[work.title]++
 		if msg, ok := v["message"]; ok {
 			work.msg = msg.(string)
 		}
@@ -259,6 +299,7 @@ func (a *Awaiter) onProgress(_ context.Context, m *protocol.ProgressParams) erro
 		}
 	case "end":
 		work.complete = true
+		a.state.completedWork[work.title]++
 		if msg, ok := v["message"]; ok {
 			work.endMsg = msg.(string)
 		}
@@ -298,17 +339,6 @@ func (a *Awaiter) checkConditionsLocked() {
 			condition.verdict <- v
 		}
 	}
-}
-
-// TakeDocumentChanges returns any accumulated document changes (from
-// server ApplyEdit RPC downcalls) and resets the list.
-func (a *Awaiter) TakeDocumentChanges() []protocol.DocumentChanges {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	res := a.state.documentChanges
-	a.state.documentChanges = nil
-	return res
 }
 
 // checkExpectations reports whether s meets all expectations.
@@ -366,8 +396,7 @@ func (a *Awaiter) Await(ctx context.Context, expectations ...Expectation) error 
 		expectations: expectations,
 		verdict:      make(chan Verdict),
 	}
-	a.waiters[a.nextWaiterID] = cond
-	a.nextWaiterID++
+	a.waiters[nextAwaiterRegistration.Add(1)] = cond
 	a.mu.Unlock()
 
 	var err error

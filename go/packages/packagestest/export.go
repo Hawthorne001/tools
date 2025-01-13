@@ -5,6 +5,10 @@
 /*
 Package packagestest creates temporary projects on disk for testing go tools on.
 
+[Note: there is an open proposal (golang/go#70229) to deprecate, tag,
+and delete this package. If accepted, the last version of the package
+be available indefinitely but will not receive updates.]
+
 By changing the exporter used, you can create projects for multiple build
 systems from the same description, and run the same tests on them in many
 cases.
@@ -147,7 +151,7 @@ type Exporter interface {
 
 // All is the list of known exporters.
 // This is used by TestAll to run tests with all the exporters.
-var All []Exporter
+var All = []Exporter{GOPATH, Modules}
 
 // TestAll invokes the testing function once for each exporter registered in
 // the All global.

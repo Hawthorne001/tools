@@ -14,7 +14,6 @@ import (
 	"go/parser"
 	"go/scanner"
 	"go/token"
-	"log"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -129,38 +128,30 @@ func parseErrorDiagnostics(pkg *syntaxPackage, errList scanner.ErrorList) ([]*Di
 var importErrorRe = regexp.MustCompile(`could not import ([^\s]+)`)
 var unsupportedFeatureRe = regexp.MustCompile(`.*require.* go(\d+\.\d+) or later`)
 
-func goGetQuickFixes(moduleMode bool, uri protocol.DocumentURI, pkg string) []SuggestedFix {
+func goGetQuickFixes(haveModule bool, uri protocol.DocumentURI, pkg string) []SuggestedFix {
 	// Go get only supports module mode for now.
-	if !moduleMode {
+	if !haveModule {
 		return nil
 	}
 	title := fmt.Sprintf("go get package %v", pkg)
-	cmd, err := command.NewGoGetPackageCommand(title, command.GoGetPackageArgs{
+	cmd := command.NewGoGetPackageCommand(title, command.GoGetPackageArgs{
 		URI:        uri,
 		AddRequire: true,
 		Pkg:        pkg,
 	})
-	if err != nil {
-		bug.Reportf("internal error building 'go get package' fix: %v", err)
-		return nil
-	}
 	return []SuggestedFix{SuggestedFixFromCommand(cmd, protocol.QuickFix)}
 }
 
-func editGoDirectiveQuickFix(moduleMode bool, uri protocol.DocumentURI, version string) []SuggestedFix {
+func editGoDirectiveQuickFix(haveModule bool, uri protocol.DocumentURI, version string) []SuggestedFix {
 	// Go mod edit only supports module mode.
-	if !moduleMode {
+	if !haveModule {
 		return nil
 	}
 	title := fmt.Sprintf("go mod edit -go=%s", version)
-	cmd, err := command.NewEditGoDirectiveCommand(title, command.EditGoDirectiveArgs{
+	cmd := command.NewEditGoDirectiveCommand(title, command.EditGoDirectiveArgs{
 		URI:     uri,
 		Version: version,
 	})
-	if err != nil {
-		bug.Reportf("internal error constructing 'edit go directive' fix: %v", err)
-		return nil
-	}
 	return []SuggestedFix{SuggestedFixFromCommand(cmd, protocol.QuickFix)}
 }
 
@@ -279,21 +270,16 @@ func toSourceDiagnostic(srcAnalyzer *settings.Analyzer, gobDiag *gobDiagnostic) 
 		related = append(related, protocol.DiagnosticRelatedInformation(gobRelated))
 	}
 
-	severity := srcAnalyzer.Severity
-	if severity == 0 {
-		severity = protocol.SeverityWarning
-	}
-
 	diag := &Diagnostic{
 		URI:      gobDiag.Location.URI,
 		Range:    gobDiag.Location.Range,
-		Severity: severity,
+		Severity: srcAnalyzer.Severity(),
 		Code:     gobDiag.Code,
 		CodeHref: gobDiag.CodeHref,
 		Source:   DiagnosticSource(gobDiag.Source),
 		Message:  gobDiag.Message,
 		Related:  related,
-		Tags:     srcAnalyzer.Tag,
+		Tags:     srcAnalyzer.Tags(),
 	}
 
 	// We cross the set of fixes (whether edit- or command-based)
@@ -301,7 +287,7 @@ func toSourceDiagnostic(srcAnalyzer *settings.Analyzer, gobDiag *gobDiagnostic) 
 	// than one kind of action (e.g. refactor, quickfix, fixall),
 	// each corresponding to a distinct client UI element
 	// or operation.
-	kinds := srcAnalyzer.ActionKinds
+	kinds := srcAnalyzer.ActionKinds()
 	if len(kinds) == 0 {
 		kinds = []protocol.CodeActionKind{protocol.QuickFix}
 	}
@@ -332,15 +318,10 @@ func toSourceDiagnostic(srcAnalyzer *settings.Analyzer, gobDiag *gobDiagnostic) 
 			// by logic "adjacent to" the analyzer.
 			//
 			// The analysis.Diagnostic.Category is used as the fix name.
-			cmd, err := command.NewApplyFixCommand(fix.Message, command.ApplyFixArgs{
-				Fix:   diag.Code,
-				URI:   gobDiag.Location.URI,
-				Range: gobDiag.Location.Range,
+			cmd := command.NewApplyFixCommand(fix.Message, command.ApplyFixArgs{
+				Fix:      diag.Code,
+				Location: gobDiag.Location,
 			})
-			if err != nil {
-				// JSON marshalling of these argument values cannot fail.
-				log.Fatalf("internal error in NewApplyFixCommand: %v", err)
-			}
 			for _, kind := range kinds {
 				fixes = append(fixes, SuggestedFixFromCommand(cmd, kind))
 			}
@@ -388,7 +369,7 @@ func typesCodeHref(linkTarget string, code typesinternal.ErrorCode) string {
 }
 
 // BuildLink constructs a URL with the given target, path, and anchor.
-func BuildLink(target, path, anchor string) string {
+func BuildLink(target, path, anchor string) protocol.URI {
 	link := fmt.Sprintf("https://%s/%s", target, path)
 	if anchor == "" {
 		return link
@@ -433,13 +414,13 @@ func splitFileLineCol(s string) (file string, line, col8 int) {
 	// strip col ":%d"
 	s, n1 := stripColonDigits(s)
 	if n1 < 0 {
-		return s, 0, 0 // "filename"
+		return s, 1, 1 // "filename"
 	}
 
 	// strip line ":%d"
 	s, n2 := stripColonDigits(s)
 	if n2 < 0 {
-		return s, n1, 0 // "filename:line"
+		return s, n1, 1 // "filename:line"
 	}
 
 	return s, n2, n1 // "filename:line:col"

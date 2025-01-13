@@ -29,7 +29,7 @@ import (
 //       (&Application{}).Main("myapp", "non-flag-command-line-arg-help", os.Args[1:])
 //     }
 // It recursively scans the application object for fields with a tag containing
-//     `flag:"flagnames" help:"short help text"``
+//     `flag:"flagnames" help:"short help text"`
 // uses all those fields to build command line flags. It will split flagnames on
 // commas and add a flag per name.
 // It expects the Application type to have a method
@@ -45,6 +45,7 @@ type Profile struct {
 	Memory string `flag:"profile.mem" help:"write memory profile to this file"`
 	Alloc  string `flag:"profile.alloc" help:"write alloc profile to this file"`
 	Trace  string `flag:"profile.trace" help:"write trace log to this file"`
+	Block  string `flag:"profile.block" help:"write block profile to this file"`
 }
 
 // Application is the interface that must be satisfied by an object passed to Main.
@@ -172,7 +173,9 @@ func Run(ctx context.Context, s *flag.FlagSet, app Application, args []string) (
 			if err := pprof.WriteHeapProfile(f); err != nil {
 				log.Printf("Writing memory profile: %v", err)
 			}
-			f.Close()
+			if err := f.Close(); err != nil {
+				log.Printf("Closing memory profile: %v", err)
+			}
 		}()
 	}
 
@@ -185,7 +188,25 @@ func Run(ctx context.Context, s *flag.FlagSet, app Application, args []string) (
 			if err := pprof.Lookup("allocs").WriteTo(f, 0); err != nil {
 				log.Printf("Writing alloc profile: %v", err)
 			}
-			f.Close()
+			if err := f.Close(); err != nil {
+				log.Printf("Closing alloc profile: %v", err)
+			}
+		}()
+	}
+
+	if p != nil && p.Block != "" {
+		f, err := os.Create(p.Block)
+		if err != nil {
+			return err
+		}
+		runtime.SetBlockProfileRate(1) // record all blocking events
+		defer func() {
+			if err := pprof.Lookup("block").WriteTo(f, 0); err != nil {
+				log.Printf("Writing block profile: %v", err)
+			}
+			if err := f.Close(); err != nil {
+				log.Printf("Closing block profile: %v", err)
+			}
 		}()
 	}
 
@@ -261,7 +282,7 @@ func addFlag(f *flag.FlagSet, value reflect.Value, flagName string, help string)
 	case *uint64:
 		f.Uint64Var(v, flagName, *v, help)
 	default:
-		log.Fatalf("Cannot understand flag of type %T", v)
+		log.Fatalf("field %q of type %T is not assignable to flag.Value", flagName, v)
 	}
 }
 

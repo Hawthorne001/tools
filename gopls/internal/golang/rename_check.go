@@ -45,7 +45,6 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/typeparams"
 	"golang.org/x/tools/internal/typesinternal"
 	"golang.org/x/tools/refactor/satisfy"
@@ -167,18 +166,20 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
 		}
 	}
 
-	// Check for conflicts between package block and all file blocks.
-	for _, f := range r.pkg.Syntax() {
-		fileScope := r.pkg.TypesInfo().Scopes[f]
-		b, prev := fileScope.LookupParent(r.to, token.NoPos)
-		if b == fileScope {
-			r.errorf(from.Pos(), "renaming this %s %q to %q would conflict", objectKind(from), from.Name(), r.to)
-			var prevPos token.Pos
-			if prev != nil {
-				prevPos = prev.Pos()
+	// In the declaring package, check for conflicts between the
+	// package block and all file blocks.
+	if from.Pkg() == r.pkg.Types() {
+		for _, f := range r.pkg.Syntax() {
+			fileScope := r.pkg.TypesInfo().Scopes[f]
+			if fileScope == nil {
+				continue // type error? (golang/go#40835)
 			}
-			r.errorf(prevPos, "\twith this %s", objectKind(prev))
-			return // since checkInPackageBlock would report redundant errors
+			b, prev := fileScope.LookupParent(r.to, token.NoPos)
+			if b == fileScope {
+				r.errorf(from.Pos(), "renaming this %s %q to %q would conflict", objectKind(from), from.Name(), r.to)
+				r.errorf(prev.Pos(), "\twith this %s", objectKind(prev))
+				return // since checkInPackageBlock would report redundant errors
+			}
 		}
 	}
 
@@ -436,7 +437,6 @@ func (r *renamer) checkLabel(label *types.Label) {
 // checkStructField checks that the field renaming will not cause
 // conflicts at its declaration, or ambiguity or changes to any selection.
 func (r *renamer) checkStructField(from *types.Var) {
-
 	// If this is the declaring package, check that the struct
 	// declaration is free of field conflicts, and field/method
 	// conflicts.
@@ -503,7 +503,7 @@ func (r *renamer) checkStructField(from *types.Var) {
 	if from.Anonymous() {
 		if named, ok := from.Type().(*types.Named); ok {
 			r.check(named.Obj())
-		} else if named, ok := aliases.Unalias(typesinternal.Unpointer(from.Type())).(*types.Named); ok {
+		} else if named, ok := types.Unalias(typesinternal.Unpointer(from.Type())).(*types.Named); ok {
 			r.check(named.Obj())
 		}
 	}
@@ -812,7 +812,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 				var iface string
 
 				I := recv(imeth).Type()
-				if named, ok := aliases.Unalias(I).(*types.Named); ok {
+				if named, ok := types.Unalias(I).(*types.Named); ok {
 					pos = named.Obj().Pos()
 					iface = "interface " + named.Obj().Name()
 				} else {
@@ -866,9 +866,17 @@ func (r *renamer) satisfy() map[satisfy.Constraint]bool {
 			//
 			// Only proceed if all packages have no errors.
 			if len(pkg.ParseErrors()) > 0 || len(pkg.TypeErrors()) > 0 {
+				var filename string
+				if len(pkg.ParseErrors()) > 0 {
+					err := pkg.ParseErrors()[0][0]
+					filename = filepath.Base(err.Pos.Filename)
+				} else if len(pkg.TypeErrors()) > 0 {
+					err := pkg.TypeErrors()[0]
+					filename = filepath.Base(err.Fset.File(err.Pos).Name())
+				}
 				r.errorf(token.NoPos, // we don't have a position for this error.
-					"renaming %q to %q not possible because %q has errors",
-					r.from, r.to, pkg.Metadata().PkgPath)
+					"renaming %q to %q not possible because %q in %q has errors",
+					r.from, r.to, filename, pkg.Metadata().PkgPath)
 				return nil
 			}
 			f.Find(pkg.TypesInfo(), pkg.Syntax())
@@ -882,7 +890,7 @@ func (r *renamer) satisfy() map[satisfy.Constraint]bool {
 
 // recv returns the method's receiver.
 func recv(meth *types.Func) *types.Var {
-	return meth.Type().(*types.Signature).Recv()
+	return meth.Signature().Recv()
 }
 
 // someUse returns an arbitrary use of obj within info.

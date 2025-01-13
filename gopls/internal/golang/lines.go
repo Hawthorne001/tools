@@ -13,18 +13,18 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/gopls/internal/util/slices"
 )
 
-// CanSplitLines checks whether we can split lists of elements inside an enclosing curly bracket/parens into separate
-// lines.
-func CanSplitLines(file *ast.File, fset *token.FileSet, start, end token.Pos) (string, bool, error) {
+// canSplitLines checks whether we can split lists of elements inside
+// an enclosing curly bracket/parens into separate lines.
+func canSplitLines(file *ast.File, fset *token.FileSet, start, end token.Pos) (string, bool, error) {
 	itemType, items, comments, _, _, _ := findSplitJoinTarget(fset, file, nil, start, end)
 	if itemType == "" {
 		return "", false, nil
@@ -45,8 +45,9 @@ func CanSplitLines(file *ast.File, fset *token.FileSet, start, end token.Pos) (s
 	return "", false, nil
 }
 
-// CanJoinLines checks whether we can join lists of elements inside an enclosing curly bracket/parens into a single line.
-func CanJoinLines(file *ast.File, fset *token.FileSet, start, end token.Pos) (string, bool, error) {
+// canJoinLines checks whether we can join lists of elements inside an
+// enclosing curly bracket/parens into a single line.
+func canJoinLines(file *ast.File, fset *token.FileSet, start, end token.Pos) (string, bool, error) {
 	itemType, items, comments, _, _, _ := findSplitJoinTarget(fset, file, nil, start, end)
 	if itemType == "" {
 		return "", false, nil
@@ -150,6 +151,15 @@ func processLines(fset *token.FileSet, items []ast.Node, comments []*ast.Comment
 		}
 
 		edits = append(edits, analysis.TextEdit{Pos: pos, End: end, NewText: []byte(sep + indent)})
+
+		// Print the Ellipsis if we synthesized one earlier.
+		if is[*ast.Ellipsis](nodes[i]) {
+			edits = append(edits, analysis.TextEdit{
+				Pos:     nodes[i].End(),
+				End:     nodes[i].End(),
+				NewText: []byte("..."),
+			})
+		}
 	}
 
 	return &analysis.SuggestedFix{TextEdits: edits}
@@ -165,39 +175,22 @@ func findSplitJoinTarget(fset *token.FileSet, file *ast.File, src []byte, start,
 		path, _ := astutil.PathEnclosingInterval(file, start, end)
 		for _, node := range path {
 			switch node := node.(type) {
-			case *ast.FuncDecl:
-				// target struct method declarations.
-				//   function (...) someMethod(a int, b int, c int) (d int, e, int) {}
-				params := node.Type.Params
-				if isCursorInside(params.Opening, params.Closing) {
-					return "parameters", params, params.Opening, params.Closing
-				}
-
-				results := node.Type.Results
-				if results != nil && isCursorInside(results.Opening, results.Closing) {
-					return "return values", results, results.Opening, results.Closing
-				}
 			case *ast.FuncType:
-				// target function signature args and result.
-				//   type someFunc func (a int, b int, c int) (d int, e int)
-				params := node.Params
-				if isCursorInside(params.Opening, params.Closing) {
-					return "parameters", params, params.Opening, params.Closing
+				// params or results of func signature
+				// Note:
+				// - each ast.Field (e.g. "x, y, z int") is considered a single item.
+				// - splitting Params and Results lists is not usually good style.
+				if p := node.Params; isCursorInside(p.Opening, p.Closing) {
+					return "parameters", p, p.Opening, p.Closing
 				}
-
-				results := node.Results
-				if results != nil && isCursorInside(results.Opening, results.Closing) {
-					return "return values", results, results.Opening, results.Closing
+				if r := node.Results; r != nil && isCursorInside(r.Opening, r.Closing) {
+					return "results", r, r.Opening, r.Closing
 				}
-			case *ast.CallExpr:
-				// target function calls.
-				//   someFunction(a, b, c)
+			case *ast.CallExpr: // f(a, b, c)
 				if isCursorInside(node.Lparen, node.Rparen) {
-					return "parameters", node, node.Lparen, node.Rparen
+					return "arguments", node, node.Lparen, node.Rparen
 				}
-			case *ast.CompositeLit:
-				// target composite lit instantiation (structs, maps, arrays).
-				//   A{b: 1, c: 2, d: 3}
+			case *ast.CompositeLit: // T{a, b, c}
 				if isCursorInside(node.Lbrace, node.Rbrace) {
 					return "elements", node, node.Lbrace, node.Rbrace
 				}
@@ -220,6 +213,18 @@ func findSplitJoinTarget(fset *token.FileSet, file *ast.File, src []byte, start,
 	case *ast.CallExpr:
 		for _, arg := range node.Args {
 			items = append(items, arg)
+		}
+
+		// Preserve "..." by wrapping the last
+		// argument in an Ellipsis node
+		// with the same Pos/End as the argument.
+		// See corresponding logic in processLines.
+		if node.Ellipsis.IsValid() {
+			last := &items[len(items)-1]
+			*last = &ast.Ellipsis{
+				Ellipsis: (*last).Pos(),      // determines Ellipsis.Pos()
+				Elt:      (*last).(ast.Expr), // determines Ellipsis.End()
+			}
 		}
 	case *ast.CompositeLit:
 		for _, arg := range node.Elts {

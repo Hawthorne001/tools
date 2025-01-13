@@ -40,7 +40,7 @@ func printfArgKind(info *types.Info, call *ast.CallExpr, argIdx int) objKind {
 	}
 
 	// Format string must be a constant.
-	strArg := info.Types[call.Args[numParams-2]].Value
+	strArg := info.Types[call.Args[numParams-2]].Value // may be zero
 	if strArg == nil || strArg.Kind() != constant.String {
 		return kindAny
 	}
@@ -152,7 +152,9 @@ func parsePrintfVerb(f string, prevIdx int) (string, []formatOperand) {
 			// Omit kindStringer and kindError though technically allowed.
 			addVerb(kindString | kindBytes | kindInt | kindFloat | kindComplex)
 		case 'p':
-			addVerb(kindPtr | kindSlice)
+			// Accept kindInterface even though it doesn't necessarily contain a pointer.
+			// This avoids us offering "&foo" when "foo" is an interface type.
+			addVerb(kindPtr | kindSlice | kindMap | kindFunc | kindInterface)
 		case 'w':
 			addVerb(kindError)
 		case '+', '-', '#', ' ', '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':

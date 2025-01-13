@@ -21,7 +21,6 @@ import (
 	"golang.org/x/tools/gopls/internal/golang/completion/snippet"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/typesinternal"
@@ -70,7 +69,7 @@ type postfixTmplArgs struct {
 	// Type is the type of "foo.bar" in "foo.bar.print!".
 	Type types.Type
 
-	// FuncResult are results of the enclosed function
+	// FuncResults are results of the enclosed function
 	FuncResults []*types.Var
 
 	sel            *ast.SelectorExpr
@@ -78,7 +77,7 @@ type postfixTmplArgs struct {
 	snip           snippet.Builder
 	importIfNeeded func(pkgPath string, scope *types.Scope) (name string, edits []protocol.TextEdit, err error)
 	edits          []protocol.TextEdit
-	qf             types.Qualifier
+	qual           types.Qualifier
 	varNames       map[string]bool
 	placeholders   bool
 	currentTabStop int
@@ -438,12 +437,13 @@ func (a *postfixTmplArgs) TypeName(t types.Type) (string, error) {
 	if t == nil || t == types.Typ[types.Invalid] {
 		return "", fmt.Errorf("invalid type: %v", t)
 	}
-	return types.TypeString(t, a.qf), nil
+	return types.TypeString(t, a.qual), nil
 }
 
 // Zero return the zero value representation of type t
 func (a *postfixTmplArgs) Zero(t types.Type) string {
-	return formatZeroValue(t, a.qf)
+	zero, _ := typesinternal.ZeroString(t, a.qual)
+	return zero
 }
 
 func (a *postfixTmplArgs) IsIdent() bool {
@@ -465,7 +465,7 @@ func (a *postfixTmplArgs) VarName(t types.Type, nonNamedDefault string) string {
 	// go/types predicates are undefined on types.Typ[types.Invalid].
 	if !types.Identical(t, types.Typ[types.Invalid]) && types.Implements(t, errorIntf) {
 		name = "err"
-	} else if !is[*types.Named](aliases.Unalias(typesinternal.Unpointer(t))) {
+	} else if !is[*types.Named](types.Unalias(typesinternal.Unpointer(t))) {
 		name = nonNamedDefault
 	}
 
@@ -588,7 +588,7 @@ func (c *completer) addPostfixSnippetCandidates(ctx context.Context, sel *ast.Se
 			Type:           selType,
 			FuncResults:    funcResults,
 			sel:            sel,
-			qf:             c.qf,
+			qual:           c.qual,
 			importIfNeeded: c.importIfNeeded,
 			scope:          scope,
 			varNames:       make(map[string]bool),

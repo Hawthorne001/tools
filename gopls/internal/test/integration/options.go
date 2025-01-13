@@ -5,8 +5,13 @@
 package integration
 
 import (
+	"strings"
+	"testing"
+	"time"
+
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
+	"golang.org/x/tools/internal/drivertest"
 )
 
 type runConfig struct {
@@ -115,8 +120,8 @@ func (s Settings) set(opts *runConfig) {
 	}
 }
 
-// WorkspaceFolders configures the workdir-relative workspace folders to send
-// to the LSP server. By default the editor sends a single workspace folder
+// WorkspaceFolders configures the workdir-relative workspace folders or uri
+// to send to the LSP server. By default the editor sends a single workspace folder
 // corresponding to the workdir root. To explicitly configure no workspace
 // folders, use WorkspaceFolders with no arguments.
 func WorkspaceFolders(relFolders ...string) RunOption {
@@ -161,6 +166,18 @@ func (e EnvVars) set(opts *runConfig) {
 	}
 }
 
+// FakeGoPackagesDriver configures gopls to run with a fake GOPACKAGESDRIVER
+// environment variable.
+func FakeGoPackagesDriver(t *testing.T) RunOption {
+	env := drivertest.Env(t)
+	vars := make(EnvVars)
+	for _, e := range env {
+		kv := strings.SplitN(e, "=", 2)
+		vars[kv[0]] = kv[1]
+	}
+	return vars
+}
+
 // InGOPATH configures the workspace working directory to be GOPATH, rather
 // than a separate working directory for use with modules.
 func InGOPATH() RunOption {
@@ -174,5 +191,16 @@ func InGOPATH() RunOption {
 func MessageResponder(f func(*protocol.ShowMessageRequestParams) (*protocol.MessageActionItem, error)) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.editor.MessageResponder = f
+	})
+}
+
+// DelayMessages can be used to fuzz message delivery delays for the purpose of
+// reproducing test flakes.
+//
+// (Even though this option may be unused, keep it around to aid in debugging
+// future flakes.)
+func DelayMessages(upto time.Duration) RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.editor.MaxMessageDelay = upto
 	})
 }

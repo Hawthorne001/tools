@@ -53,7 +53,7 @@ func Start() {
 // As an optimization, use a 100MB in-memory LRU cache in front of filecache
 // operations. This reduces I/O for operations such as diagnostics or
 // implementations that repeatedly access the same cache entries.
-var memCache = lru.New(100 * 1e6)
+var memCache = lru.New[memKey, []byte](100 * 1e6)
 
 type memKey struct {
 	kind string
@@ -62,15 +62,20 @@ type memKey struct {
 
 // Get retrieves from the cache and returns the value most recently
 // supplied to Set(kind, key), possibly by another process.
-// Get returns ErrNotFound if the value was not found.
+//
+// Get returns ErrNotFound if the value was not found. The first call
+// to Get may fail due to ENOSPC or deletion of the process's
+// executable. Other causes of failure include deletion or corruption
+// of the cache (by external meddling) while gopls is running, or
+// faulty hardware; see issue #67433.
 //
 // Callers should not modify the returned array.
 func Get(kind string, key [32]byte) ([]byte, error) {
 	// First consult the read-through memory cache.
 	// Note that memory cache hits do not update the times
 	// used for LRU eviction of the file-based cache.
-	if value := memCache.Get(memKey{kind, key}); value != nil {
-		return value.([]byte), nil
+	if value, ok := memCache.Get(memKey{kind, key}); ok {
+		return value, nil
 	}
 
 	iolimit <- struct{}{}        // acquire a token
@@ -79,6 +84,8 @@ func Get(kind string, key [32]byte) ([]byte, error) {
 	// Read the index file, which provides the name of the CAS file.
 	indexName, err := filename(kind, key)
 	if err != nil {
+		// e.g. ENOSPC, deletion of executable (first time only);
+		// deletion of cache (at any time).
 		return nil, err
 	}
 	indexData, err := os.ReadFile(indexName)
@@ -100,7 +107,7 @@ func Get(kind string, key [32]byte) ([]byte, error) {
 	// engineered hash collision, which is infeasible.
 	casName, err := filename(casKind, valueHash)
 	if err != nil {
-		return nil, err
+		return nil, err // see above for possible causes
 	}
 	value, _ := os.ReadFile(casName) // ignore error
 	if sha256.Sum256(value) != valueHash {
@@ -138,6 +145,13 @@ func Get(kind string, key [32]byte) ([]byte, error) {
 var ErrNotFound = fmt.Errorf("not found")
 
 // Set updates the value in the cache.
+//
+// Set may fail due to:
+// - failure to access/create the cache (first call only);
+// - out of space (ENOSPC);
+// - deletion of the cache concurrent with a call to Set;
+// - faulty hardware.
+// See issue #67433.
 func Set(kind string, key [32]byte, value []byte) error {
 	memCache.Set(memKey{kind, key}, value, len(value))
 
@@ -353,13 +367,13 @@ func getCacheDir() (string, error) {
 		// Compute the hash of this executable (~20ms) and create a subdirectory.
 		hash, err := hashExecutable()
 		if err != nil {
-			cacheDirErr = fmt.Errorf("can't hash gopls executable: %v", err)
+			cacheDirErr = fmt.Errorf("can't hash gopls executable: %w", err)
 		}
 		// Use only 32 bits of the digest to avoid unwieldy filenames.
 		// It's not an adversarial situation.
 		cacheDir = filepath.Join(goplsDir, fmt.Sprintf("%x", hash[:4]))
 		if err := os.MkdirAll(cacheDir, 0700); err != nil {
-			cacheDirErr = fmt.Errorf("can't create cache: %v", err)
+			cacheDirErr = fmt.Errorf("can't create cache: %w", err)
 		}
 	})
 	return cacheDir, cacheDirErr
@@ -426,8 +440,6 @@ func gc(goplsDir string) {
 	// /usr/bin/find achieves only about 25,000 stats per second
 	// at full speed (no pause between items), meaning a large
 	// cache may take several minutes to scan.
-	// We must ensure that short-lived processes (crucially,
-	// tests) are able to make progress sweeping garbage.
 	//
 	// (gopls' caches should never actually get this big in
 	// practice: the example mentioned above resulted from a bug
@@ -439,6 +451,11 @@ func gc(goplsDir string) {
 	dirs := make(map[string]bool)
 
 	for {
+		// Wait unconditionally for the minimum period.
+		// We do this even on the first run so that tests
+		// don't (all) run the GC.
+		time.Sleep(minPeriod)
+
 		// Enumerate all files in the cache.
 		type item struct {
 			path  string
@@ -459,8 +476,6 @@ func gc(goplsDir string) {
 				}
 			} else {
 				// Unconditionally delete files we haven't used in ages.
-				// (We do this here, not in the second loop, so that we
-				// perform age-based collection even in short-lived processes.)
 				age := time.Since(stat.ModTime())
 				if age > maxAge {
 					if debug {
@@ -502,9 +517,6 @@ func gc(goplsDir string) {
 			total -= file.size
 		}
 		files = nil // release memory before sleep
-
-		// Wait unconditionally for the minimum period.
-		time.Sleep(minPeriod)
 
 		// Once only, delete all directories.
 		// This will succeed only for the empty ones,

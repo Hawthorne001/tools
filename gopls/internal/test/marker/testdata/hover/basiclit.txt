@@ -1,5 +1,10 @@
 This test checks gopls behavior when hovering over basic literals.
 
+Skipped on ppc64 as there appears to be a bug on aix-ppc64: golang/go#67526.
+
+-- flags --
+-skip_goarch=ppc64
+
 -- basiclit.go --
 package basiclit
 

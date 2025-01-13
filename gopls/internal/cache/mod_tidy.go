@@ -18,12 +18,11 @@ import (
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/label"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/event/tag"
-	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/memoize"
 )
 
@@ -78,7 +77,7 @@ func (s *Snapshot) ModTidy(ctx context.Context, pm *ParsedModule) (*TidiedModule
 		}
 
 		handle := memoize.NewPromise("modTidy", func(ctx context.Context, arg interface{}) interface{} {
-			tidied, err := modTidyImpl(ctx, arg.(*Snapshot), uri.Path(), pm)
+			tidied, err := modTidyImpl(ctx, arg.(*Snapshot), pm)
 			return modTidyResult{tidied, err}
 		})
 
@@ -98,34 +97,34 @@ func (s *Snapshot) ModTidy(ctx context.Context, pm *ParsedModule) (*TidiedModule
 }
 
 // modTidyImpl runs "go mod tidy" on a go.mod file.
-func modTidyImpl(ctx context.Context, snapshot *Snapshot, filename string, pm *ParsedModule) (*TidiedModule, error) {
-	ctx, done := event.Start(ctx, "cache.ModTidy", tag.URI.Of(filename))
+func modTidyImpl(ctx context.Context, snapshot *Snapshot, pm *ParsedModule) (*TidiedModule, error) {
+	ctx, done := event.Start(ctx, "cache.ModTidy", label.URI.Of(pm.URI))
 	defer done()
 
-	inv := &gocommand.Invocation{
-		Verb:       "mod",
-		Args:       []string{"tidy"},
-		WorkingDir: filepath.Dir(filename),
-	}
-	// TODO(adonovan): ensure that unsaved overlays are passed through to 'go'.
-	tmpURI, inv, cleanup, err := snapshot.goCommandInvocation(ctx, WriteTemporaryModFile, inv)
+	tempDir, cleanup, err := TempModDir(ctx, snapshot, pm.URI)
 	if err != nil {
 		return nil, err
 	}
-	// Keep the temporary go.mod file around long enough to parse it.
 	defer cleanup()
 
+	args := []string{"tidy", "-modfile=" + filepath.Join(tempDir, "go.mod")}
+	inv, cleanupInvocation, err := snapshot.GoCommandInvocation(NoNetwork, pm.URI.DirPath(), "mod", args, "GOWORK=off")
+	if err != nil {
+		return nil, err
+	}
+	defer cleanupInvocation()
 	if _, err := snapshot.view.gocmdRunner.Run(ctx, *inv); err != nil {
 		return nil, err
 	}
 
 	// Go directly to disk to get the temporary mod file,
 	// since it is always on disk.
-	tempContents, err := os.ReadFile(tmpURI.Path())
+	tempMod := filepath.Join(tempDir, "go.mod")
+	tempContents, err := os.ReadFile(tempMod)
 	if err != nil {
 		return nil, err
 	}
-	ideal, err := modfile.Parse(tmpURI.Path(), tempContents, nil)
+	ideal, err := modfile.Parse(tempMod, tempContents, nil)
 	if err != nil {
 		// We do not need to worry about the temporary file's parse errors
 		// since it has been "tidied".
@@ -263,7 +262,7 @@ func missingModuleDiagnostics(ctx context.Context, snapshot *Snapshot, pm *Parse
 			// Example:
 			//
 			// import (
-			//   "golang.org/x/tools/go/expect"
+			//   "golang.org/x/tools/internal/expect"
 			//   "golang.org/x/tools/go/packages"
 			// )
 			// They both are related to the same module: "golang.org/x/tools".
@@ -329,14 +328,11 @@ func unusedDiagnostic(m *protocol.Mapper, req *modfile.Require, onlyDiagnostic b
 		return nil, err
 	}
 	title := fmt.Sprintf("Remove dependency: %s", req.Mod.Path)
-	cmd, err := command.NewRemoveDependencyCommand(title, command.RemoveDependencyArgs{
+	cmd := command.NewRemoveDependencyCommand(title, command.RemoveDependencyArgs{
 		URI:            m.URI,
 		OnlyDiagnostic: onlyDiagnostic,
 		ModulePath:     req.Mod.Path,
 	})
-	if err != nil {
-		return nil, err
-	}
 	return &Diagnostic{
 		URI:            m.URI,
 		Range:          rng,
@@ -402,14 +398,11 @@ func missingModuleDiagnostic(pm *ParsedModule, req *modfile.Require) (*Diagnosti
 		}
 	}
 	title := fmt.Sprintf("Add %s to your go.mod file", req.Mod.Path)
-	cmd, err := command.NewAddDependencyCommand(title, command.DependencyArgs{
+	cmd := command.NewAddDependencyCommand(title, command.DependencyArgs{
 		URI:        pm.Mapper.URI,
 		AddRequire: !req.Indirect,
 		GoCmdArgs:  []string{req.Mod.Path + "@" + req.Mod.Version},
 	})
-	if err != nil {
-		return nil, err
-	}
 	return &Diagnostic{
 		URI:            pm.Mapper.URI,
 		Range:          rng,

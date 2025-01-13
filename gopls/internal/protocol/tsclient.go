@@ -6,8 +6,8 @@
 
 package protocol
 
-// Code generated from protocol/metaModel.json at ref release/protocol/3.17.6-next.2 (hash 654dc9be6673c61476c28fda604406279c3258d7).
-// https://github.com/microsoft/vscode-languageserver-node/blob/release/protocol/3.17.6-next.2/protocol/metaModel.json
+// Code generated from protocol/metaModel.json at ref release/protocol/3.17.6-next.9 (hash c94395b5da53729e6dff931293b051009ccaaaa4).
+// https://github.com/microsoft/vscode-languageserver-node/blob/release/protocol/3.17.6-next.9/protocol/metaModel.json
 // LSP metaData.version = 3.17.0.
 
 import (
@@ -17,26 +17,48 @@ import (
 )
 
 type Client interface {
-	LogTrace(context.Context, *LogTraceParams) error                                           // $/logTrace
-	Progress(context.Context, *ProgressParams) error                                           // $/progress
-	RegisterCapability(context.Context, *RegistrationParams) error                             // client/registerCapability
-	UnregisterCapability(context.Context, *UnregistrationParams) error                         // client/unregisterCapability
-	Event(context.Context, *interface{}) error                                                 // telemetry/event
-	PublishDiagnostics(context.Context, *PublishDiagnosticsParams) error                       // textDocument/publishDiagnostics
-	LogMessage(context.Context, *LogMessageParams) error                                       // window/logMessage
-	ShowDocument(context.Context, *ShowDocumentParams) (*ShowDocumentResult, error)            // window/showDocument
-	ShowMessage(context.Context, *ShowMessageParams) error                                     // window/showMessage
-	ShowMessageRequest(context.Context, *ShowMessageRequestParams) (*MessageActionItem, error) // window/showMessageRequest
-	WorkDoneProgressCreate(context.Context, *WorkDoneProgressCreateParams) error               // window/workDoneProgress/create
-	ApplyEdit(context.Context, *ApplyWorkspaceEditParams) (*ApplyWorkspaceEditResult, error)   // workspace/applyEdit
-	CodeLensRefresh(context.Context) error                                                     // workspace/codeLens/refresh
-	Configuration(context.Context, *ParamConfiguration) ([]LSPAny, error)                      // workspace/configuration
-	DiagnosticRefresh(context.Context) error                                                   // workspace/diagnostic/refresh
-	FoldingRangeRefresh(context.Context) error                                                 // workspace/foldingRange/refresh
-	InlayHintRefresh(context.Context) error                                                    // workspace/inlayHint/refresh
-	InlineValueRefresh(context.Context) error                                                  // workspace/inlineValue/refresh
-	SemanticTokensRefresh(context.Context) error                                               // workspace/semanticTokens/refresh
-	WorkspaceFolders(context.Context) ([]WorkspaceFolder, error)                               // workspace/workspaceFolders
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#logTrace
+	LogTrace(context.Context, *LogTraceParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#progress
+	Progress(context.Context, *ProgressParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#client_registerCapability
+	RegisterCapability(context.Context, *RegistrationParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#client_unregisterCapability
+	UnregisterCapability(context.Context, *UnregistrationParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#telemetry_event
+	Event(context.Context, *any) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#textDocument_publishDiagnostics
+	PublishDiagnostics(context.Context, *PublishDiagnosticsParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#window_logMessage
+	LogMessage(context.Context, *LogMessageParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#window_showDocument
+	ShowDocument(context.Context, *ShowDocumentParams) (*ShowDocumentResult, error)
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#window_showMessage
+	ShowMessage(context.Context, *ShowMessageParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#window_showMessageRequest
+	ShowMessageRequest(context.Context, *ShowMessageRequestParams) (*MessageActionItem, error)
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#window_workDoneProgress_create
+	WorkDoneProgressCreate(context.Context, *WorkDoneProgressCreateParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_applyEdit
+	ApplyEdit(context.Context, *ApplyWorkspaceEditParams) (*ApplyWorkspaceEditResult, error)
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_codeLens_refresh
+	CodeLensRefresh(context.Context) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_configuration
+	Configuration(context.Context, *ParamConfiguration) ([]LSPAny, error)
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_diagnostic_refresh
+	DiagnosticRefresh(context.Context) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_foldingRange_refresh
+	FoldingRangeRefresh(context.Context) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_inlayHint_refresh
+	InlayHintRefresh(context.Context) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_inlineValue_refresh
+	InlineValueRefresh(context.Context) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_semanticTokens_refresh
+	SemanticTokensRefresh(context.Context) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_textDocumentContent_refresh
+	TextDocumentContentRefresh(context.Context, *TextDocumentContentRefreshParams) error
+	// See https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification#workspace_workspaceFolders
+	WorkspaceFolders(context.Context) ([]WorkspaceFolder, error)
 }
 
 func clientDispatch(ctx context.Context, client Client, reply jsonrpc2.Replier, r jsonrpc2.Request) (bool, error) {
@@ -75,7 +97,7 @@ func clientDispatch(ctx context.Context, client Client, reply jsonrpc2.Replier, 
 		return true, reply(ctx, nil, err)
 
 	case "telemetry/event":
-		var params interface{}
+		var params any
 		if err := UnmarshalJSON(r.Params(), &params); err != nil {
 			return true, sendParseError(ctx, reply, err)
 		}
@@ -182,6 +204,14 @@ func clientDispatch(ctx context.Context, client Client, reply jsonrpc2.Replier, 
 		err := client.SemanticTokensRefresh(ctx)
 		return true, reply(ctx, nil, err)
 
+	case "workspace/textDocumentContent/refresh":
+		var params TextDocumentContentRefreshParams
+		if err := UnmarshalJSON(r.Params(), &params); err != nil {
+			return true, sendParseError(ctx, reply, err)
+		}
+		err := client.TextDocumentContentRefresh(ctx, &params)
+		return true, reply(ctx, nil, err)
+
 	case "workspace/workspaceFolders":
 		resp, err := client.WorkspaceFolders(ctx)
 		if err != nil {
@@ -206,7 +236,7 @@ func (s *clientDispatcher) RegisterCapability(ctx context.Context, params *Regis
 func (s *clientDispatcher) UnregisterCapability(ctx context.Context, params *UnregistrationParams) error {
 	return s.sender.Call(ctx, "client/unregisterCapability", params, nil)
 }
-func (s *clientDispatcher) Event(ctx context.Context, params *interface{}) error {
+func (s *clientDispatcher) Event(ctx context.Context, params *any) error {
 	return s.sender.Notify(ctx, "telemetry/event", params)
 }
 func (s *clientDispatcher) PublishDiagnostics(ctx context.Context, params *PublishDiagnosticsParams) error {
@@ -266,6 +296,9 @@ func (s *clientDispatcher) InlineValueRefresh(ctx context.Context) error {
 }
 func (s *clientDispatcher) SemanticTokensRefresh(ctx context.Context) error {
 	return s.sender.Call(ctx, "workspace/semanticTokens/refresh", nil, nil)
+}
+func (s *clientDispatcher) TextDocumentContentRefresh(ctx context.Context, params *TextDocumentContentRefreshParams) error {
+	return s.sender.Call(ctx, "workspace/textDocumentContent/refresh", params, nil)
 }
 func (s *clientDispatcher) WorkspaceFolders(ctx context.Context) ([]WorkspaceFolder, error) {
 	var result []WorkspaceFolder

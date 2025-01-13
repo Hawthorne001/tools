@@ -13,11 +13,9 @@ import (
 	"os"
 	"reflect"
 	"strings"
-	"sync"
 	"unsafe"
 
 	"golang.org/x/tools/go/ssa"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -236,8 +234,8 @@ func zero(t types.Type) value {
 		return a
 	case *types.Named:
 		return zero(t.Underlying())
-	case *aliases.Alias:
-		return zero(aliases.Unalias(t))
+	case *types.Alias:
+		return zero(types.Unalias(t))
 	case *types.Interface:
 		return iface{} // nil type, methodset and value
 	case *types.Slice:
@@ -951,27 +949,8 @@ func typeAssert(i *interpreter, instr *ssa.TypeAssert, itf iface) value {
 	return v
 }
 
-// If CapturedOutput is non-nil, all writes by the interpreted program
-// to file descriptors 1 and 2 will also be written to CapturedOutput.
-//
-// (The $GOROOT/test system requires that the test be considered a
-// failure if "BUG" appears in the combined stdout/stderr output, even
-// if it exits zero.  This is a global variable shared by all
-// interpreters in the same process.)
+// This variable is no longer used but remains to prevent build breakage.
 var CapturedOutput *bytes.Buffer
-var capturedOutputMu sync.Mutex
-
-// write writes bytes b to the target program's standard output.
-// The print/println built-ins and the write() system call funnel
-// through here so they can be captured by the test driver.
-func print(b []byte) (int, error) {
-	if CapturedOutput != nil {
-		capturedOutputMu.Lock()
-		CapturedOutput.Write(b) // ignore errors
-		capturedOutputMu.Unlock()
-	}
-	return os.Stdout.Write(b)
-}
 
 // callBuiltin interprets a call to builtin fn with arguments args,
 // returning its result.
@@ -1027,7 +1006,7 @@ func callBuiltin(caller *frame, callpos token.Pos, fn *ssa.Builtin, args []value
 		if ln {
 			buf.WriteRune('\n')
 		}
-		print(buf.Bytes())
+		os.Stderr.Write(buf.Bytes())
 		return nil
 
 	case "len":
@@ -1116,6 +1095,9 @@ func callBuiltin(caller *frame, callpos token.Pos, fn *ssa.Builtin, args []value
 				recvType, methodName, recvType))
 		}
 		return recv
+
+	case "ssa:deferstack":
+		return &caller.defers
 	}
 
 	panic("unknown built-in: " + fn.Name())

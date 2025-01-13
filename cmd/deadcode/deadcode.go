@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build go1.20
-
 package main
 
 import (
@@ -260,7 +258,7 @@ func main() {
 			edges = append(edges, jsonEdge{
 				Initial:  cond(len(edges) == 0, prettyName(edge.Caller.Func, true), ""),
 				Kind:     cond(isStaticCall(edge), "static", "dynamic"),
-				Position: toJSONPosition(prog.Fset.Position(edge.Site.Pos())),
+				Position: toJSONPosition(prog.Fset.Position(edge.Pos())),
 				Callee:   prettyName(edge.Callee.Func, true),
 			})
 		}

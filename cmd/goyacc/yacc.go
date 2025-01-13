@@ -52,6 +52,7 @@ import (
 	"go/format"
 	"math"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode"
@@ -606,7 +607,7 @@ outer:
 				}
 				j = chfind(2, tokname)
 				if j >= NTBASE {
-					lerrorf(ruleline, "nonterminal "+nontrst[j-NTBASE].name+" illegal after %%prec")
+					lerrorf(ruleline, "nonterminal %s illegal after %%prec", nontrst[j-NTBASE].name)
 				}
 				levprd[nprod] = toklev[j]
 				t = gettok()
@@ -1565,7 +1566,7 @@ more:
 		}
 		if pempty[i] != OK {
 			fatfl = 0
-			errorf("nonterminal " + nontrst[i].name + " never derives any token string")
+			errorf("nonterminal %s never derives any token string", nontrst[i].name)
 		}
 	}
 
@@ -2323,7 +2324,7 @@ func wrstate(i int) {
 	var pp, qq int
 
 	if len(errors) > 0 {
-		actions := append([]int(nil), temp1...)
+		actions := slices.Clone(temp1)
 		defaultAction := ERRCODE
 		if lastred != 0 {
 			defaultAction = -lastred
@@ -3176,7 +3177,7 @@ func create(s string) *bufio.Writer {
 }
 
 // write out error comment
-func lerrorf(lineno int, s string, v ...interface{}) {
+func lerrorf(lineno int, s string, v ...any) {
 	nerrors++
 	fmt.Fprintf(stderr, s, v...)
 	fmt.Fprintf(stderr, ": %v:%v\n", infile, lineno)
@@ -3186,7 +3187,7 @@ func lerrorf(lineno int, s string, v ...interface{}) {
 	}
 }
 
-func errorf(s string, v ...interface{}) {
+func errorf(s string, v ...any) {
 	lerrorf(lineno, s, v...)
 }
 

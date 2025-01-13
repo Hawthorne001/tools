@@ -2,10 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package rename contains the implementation of the 'gorename' command
-// whose main function is in golang.org/x/tools/cmd/gorename.
-// See the Usage constant for the command documentation.
-package rename // import "golang.org/x/tools/refactor/rename"
+// Package rename contains the obsolete implementation of the deleted
+// golang.org/x/tools/cmd/gorename. This logic has not worked properly
+// since the advent of Go modules, and should be deleted too.
+//
+// Use gopls instead, either via the Rename LSP method or the "gopls
+// rename" subcommand.
+package rename
 
 import (
 	"bytes"
@@ -487,7 +490,7 @@ func (r *renamer) update() error {
 	var generatedFileNames []string
 	for _, info := range r.packages {
 		for _, f := range info.Files {
-			tokenFile := r.iprog.Fset.File(f.Pos())
+			tokenFile := r.iprog.Fset.File(f.FileStart)
 			if filesToUpdate[tokenFile] && generated(f, tokenFile) {
 				generatedFileNames = append(generatedFileNames, tokenFile.Name())
 			}
@@ -502,7 +505,7 @@ func (r *renamer) update() error {
 	for _, info := range r.packages {
 		first := true
 		for _, f := range info.Files {
-			tokenFile := r.iprog.Fset.File(f.Pos())
+			tokenFile := r.iprog.Fset.File(f.FileStart)
 			if filesToUpdate[tokenFile] {
 				if first {
 					npkgs++

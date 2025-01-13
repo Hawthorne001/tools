@@ -6,10 +6,11 @@ package codelens
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
-	"golang.org/x/tools/gopls/internal/hooks"
 	"golang.org/x/tools/gopls/internal/server"
+	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/test/compare"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/util/bug"
@@ -21,7 +22,7 @@ import (
 
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
-	Main(m, hooks.Options)
+	os.Exit(Main(m))
 }
 
 func TestDisablingCodeLens(t *testing.T) {
@@ -54,7 +55,7 @@ const (
 		},
 		{
 			label:        "generate disabled",
-			enabled:      map[string]bool{string(command.Generate): false},
+			enabled:      map[string]bool{string(settings.CodeLensGenerate): false},
 			wantCodeLens: false,
 		},
 	}
@@ -181,10 +182,10 @@ require golang.org/x/hello v1.2.3
 				if !found {
 					t.Fatalf("found no command with the title %s", commandTitle)
 				}
-				if _, err := env.Editor.ExecuteCommand(env.Ctx, &protocol.ExecuteCommandParams{
+				if err := env.Editor.ExecuteCommand(env.Ctx, &protocol.ExecuteCommandParams{
 					Command:   lens.Command.Command,
 					Arguments: lens.Command.Arguments,
-				}); err != nil {
+				}, nil); err != nil {
 					t.Fatal(err)
 				}
 				env.AfterChange()
@@ -251,7 +252,8 @@ func TestUpgradeCodelens_ModVendor(t *testing.T) {
 	// This test checks the regression of golang/go#66055. The upgrade codelens
 	// should work in a mod vendor context (the test above using a go.work file
 	// was not broken).
-	testenv.NeedsGo1Point(t, 22)
+	testenv.NeedsGoCommand1Point(t, 22)
+
 	const shouldUpdateDep = `
 -- go.mod --
 module mod.com/a
@@ -331,6 +333,8 @@ go 1.14
 
 require golang.org/x/hello v1.0.0
 require golang.org/x/unused v1.0.0
+
+// EOF
 -- go.sum --
 golang.org/x/hello v1.0.0 h1:qbzE1/qT0/zojAMd/JcPsO2Vb9K4Bkeyq0vB2JGMmsw=
 golang.org/x/hello v1.0.0/go.mod h1:WW7ER2MRNXWA6c8/4bDIek4Hc/+DofTrMaQQitGXcco=
@@ -347,6 +351,7 @@ func main() {
 `
 	WithOptions(ProxyFiles(proxy)).Run(t, shouldRemoveDep, func(t *testing.T, env *Env) {
 		env.OpenFile("go.mod")
+		env.RegexpReplace("go.mod", "// EOF", "// EOF unsaved edit") // unsaved edits ok
 		env.ExecuteCodeLensCommand("go.mod", command.Tidy, nil)
 		env.AfterChange()
 		got := env.BufferText("go.mod")
@@ -355,6 +360,8 @@ func main() {
 go 1.14
 
 require golang.org/x/hello v1.0.0
+
+// EOF unsaved edit
 `
 		if got != wantGoMod {
 			t.Fatalf("go.mod tidy failed:\n%s", compare.Text(wantGoMod, got))

@@ -24,7 +24,6 @@ import (
 	"golang.org/x/tools/gopls/internal/debug"
 	"golang.org/x/tools/gopls/internal/lsprpc"
 	"golang.org/x/tools/gopls/internal/protocol"
-	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/jsonrpc2/servertest"
@@ -45,17 +44,15 @@ import (
 // TODO(rfindley, cleanup): rather than using arbitrary names for these modes,
 // we can compose them explicitly out of the features described here, allowing
 // individual tests more freedom in constructing problematic execution modes.
-// For example, a test could assert on a certain behavior when running with
-// experimental options on a separate process. Moreover, we could unify 'Modes'
-// with 'Options', and use RunMultiple rather than a hard-coded loop through
-// modes.
+// For example, a test could assert on a certain behavior when running on a
+// separate process. Moreover, we could unify 'Modes' with 'Options', and use
+// RunMultiple rather than a hard-coded loop through modes.
 //
 // Mode            | Options      | Shared Cache? | Shared Server? | In-process?
 // ---------------------------------------------------------------------------
 // Default         | Default      | Y             | N              | Y
 // Forwarded       | Default      | Y             | Y              | Y
 // SeparateProcess | Default      | Y             | Y              | N
-// Experimental    | Experimental | N             | N              | Y
 type Mode int
 
 const (
@@ -76,13 +73,6 @@ const (
 	//
 	// Only supported on GOOS=linux.
 	SeparateProcess
-
-	// Experimental enables all of the experimental configurations that are
-	// being developed, and runs gopls in sidecar mode.
-	//
-	// It uses a separate cache for each test, to exercise races that may only
-	// appear with cache misses.
-	Experimental
 )
 
 func (m Mode) String() string {
@@ -93,8 +83,6 @@ func (m Mode) String() string {
 		return "forwarded"
 	case SeparateProcess:
 		return "separate process"
-	case Experimental:
-		return "experimental"
 	default:
 		return "unknown mode"
 	}
@@ -106,11 +94,10 @@ func (m Mode) String() string {
 // state.
 type Runner struct {
 	// Configuration
-	DefaultModes             Mode                    // modes to run for each test
-	Timeout                  time.Duration           // per-test timeout, if set
-	PrintGoroutinesOnFailure bool                    // whether to dump goroutines on test failure
-	SkipCleanup              bool                    // if set, don't delete test data directories when the test exits
-	OptionsHook              func(*settings.Options) // if set, use these options when creating gopls sessions
+	DefaultModes             Mode          // modes to run for each test
+	Timeout                  time.Duration // per-test timeout, if set
+	PrintGoroutinesOnFailure bool          // whether to dump goroutines on test failure
+	SkipCleanup              bool          // if set, don't delete test data directories when the test exits
 
 	// Immutable state shared across test invocations
 	goplsPath string         // path to the gopls executable (for SeparateProcess mode)
@@ -147,12 +134,11 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 	tests := []struct {
 		name      string
 		mode      Mode
-		getServer func(func(*settings.Options)) jsonrpc2.StreamServer
+		getServer func() jsonrpc2.StreamServer
 	}{
 		{"default", Default, r.defaultServer},
 		{"forwarded", Forwarded, r.forwardedServer},
 		{"separate_process", SeparateProcess, r.separateProcessServer},
-		{"experimental", Experimental, r.experimentalServer},
 	}
 
 	for _, tc := range tests {
@@ -217,32 +203,19 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 
 			// Write the go.sum file for the requested directories, before starting the server.
 			for _, dir := range config.writeGoSum {
-				if err := sandbox.RunGoCommand(context.Background(), dir, "list", []string{"-mod=mod", "./..."}, []string{"GOWORK=off"}, true); err != nil {
+				if _, err := sandbox.RunGoCommand(context.Background(), dir, "list", []string{"-mod=mod", "./..."}, []string{"GOWORK=off"}, true); err != nil {
 					t.Fatal(err)
 				}
 			}
 
-			ss := tc.getServer(r.OptionsHook)
+			ss := tc.getServer()
 
 			framer := jsonrpc2.NewRawStream
 			ls := &loggingFramer{}
 			framer = ls.framer(jsonrpc2.NewRawStream)
 			ts := servertest.NewPipeServer(ss, framer)
 
-			awaiter := NewAwaiter(sandbox.Workdir)
-			const skipApplyEdits = false
-			editor, err := fake.NewEditor(sandbox, config.editor).Connect(ctx, ts, awaiter.Hooks(), skipApplyEdits)
-			if err != nil {
-				t.Fatal(err)
-			}
-			env := &Env{
-				T:       t,
-				Ctx:     ctx,
-				Sandbox: sandbox,
-				Editor:  editor,
-				Server:  ts,
-				Awaiter: awaiter,
-			}
+			env := ConnectGoplsEnv(t, ctx, sandbox, config.editor, ts)
 			defer func() {
 				if t.Failed() && r.PrintGoroutinesOnFailure {
 					pprof.Lookup("goroutine").WriteTo(os.Stderr, 1)
@@ -257,7 +230,7 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 				// the editor: in general we want to clean up before proceeding to the
 				// next test, and if there is a deadlock preventing closing it will
 				// eventually be handled by the `go test` timeout.
-				if err := editor.Close(xcontext.Detach(ctx)); err != nil {
+				if err := env.Editor.Close(xcontext.Detach(ctx)); err != nil {
 					t.Errorf("closing editor: %v", err)
 				}
 			}()
@@ -268,19 +241,42 @@ func (r *Runner) Run(t *testing.T, files string, test TestFunc, opts ...RunOptio
 	}
 }
 
+// ConnectGoplsEnv creates a new Gopls environment for the given sandbox,
+// editor config, and server connector.
+//
+// TODO(rfindley): significantly refactor the way testing environments are
+// constructed.
+func ConnectGoplsEnv(t testing.TB, ctx context.Context, sandbox *fake.Sandbox, config fake.EditorConfig, connector servertest.Connector) *Env {
+	awaiter := NewAwaiter(sandbox.Workdir)
+	editor, err := fake.NewEditor(sandbox, config).Connect(ctx, connector, awaiter.Hooks())
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := &Env{
+		T:       t,
+		Ctx:     ctx,
+		Sandbox: sandbox,
+		Server:  connector,
+		Editor:  editor,
+		Awaiter: awaiter,
+	}
+	return env
+}
+
 // longBuilders maps builders that are skipped when -short is set to a
 // (possibly empty) justification.
 var longBuilders = map[string]string{
-	"openbsd-amd64-64":        "golang.org/issues/42789",
-	"openbsd-386-64":          "golang.org/issues/42789",
-	"openbsd-386-68":          "golang.org/issues/42789",
-	"openbsd-amd64-68":        "golang.org/issues/42789",
+	"openbsd-amd64-64":        "go.dev/issue/42789",
+	"openbsd-386-64":          "go.dev/issue/42789",
+	"openbsd-386-68":          "go.dev/issue/42789",
+	"openbsd-amd64-68":        "go.dev/issue/42789",
 	"darwin-amd64-10_12":      "",
 	"freebsd-amd64-race":      "",
 	"illumos-amd64":           "",
 	"netbsd-arm-bsiegert":     "",
 	"solaris-amd64-oraclerel": "",
 	"windows-arm-zx2c4":       "",
+	"linux-ppc64le-power9osu": "go.dev/issue/66748",
 }
 
 // TODO(rfindley): inline into Main.
@@ -345,25 +341,16 @@ func (s *loggingFramer) printBuffers(testname string, w io.Writer) {
 }
 
 // defaultServer handles the Default execution mode.
-func (r *Runner) defaultServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
-	return lsprpc.NewStreamServer(cache.New(r.store), false, optsHook)
-}
-
-// experimentalServer handles the Experimental execution mode.
-func (r *Runner) experimentalServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
-	options := func(o *settings.Options) {
-		optsHook(o)
-		o.EnableAllExperiments()
-	}
-	return lsprpc.NewStreamServer(cache.New(nil), false, options)
+func (r *Runner) defaultServer() jsonrpc2.StreamServer {
+	return lsprpc.NewStreamServer(cache.New(r.store), false, nil)
 }
 
 // forwardedServer handles the Forwarded execution mode.
-func (r *Runner) forwardedServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+func (r *Runner) forwardedServer() jsonrpc2.StreamServer {
 	r.tsOnce.Do(func() {
 		ctx := context.Background()
 		ctx = debug.WithInstance(ctx, "off")
-		ss := lsprpc.NewStreamServer(cache.New(nil), false, optsHook)
+		ss := lsprpc.NewStreamServer(cache.New(nil), false, nil)
 		r.ts = servertest.NewTCPServer(ctx, ss, nil)
 	})
 	return newForwarder("tcp", r.ts.Addr)
@@ -375,7 +362,7 @@ func (r *Runner) forwardedServer(optsHook func(*settings.Options)) jsonrpc2.Stre
 const runTestAsGoplsEnvvar = "_GOPLS_TEST_BINARY_RUN_AS_GOPLS"
 
 // separateProcessServer handles the SeparateProcess execution mode.
-func (r *Runner) separateProcessServer(optsHook func(*settings.Options)) jsonrpc2.StreamServer {
+func (r *Runner) separateProcessServer() jsonrpc2.StreamServer {
 	if runtime.GOOS != "linux" {
 		panic("separate process execution mode is only supported on linux")
 	}

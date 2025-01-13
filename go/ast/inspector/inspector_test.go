@@ -47,7 +47,7 @@ func parseNetFiles() ([]*ast.File, error) {
 	return files, nil
 }
 
-// TestAllNodes compares Inspector against ast.Inspect.
+// TestInspectAllNodes compares Inspector against ast.Inspect.
 func TestInspectAllNodes(t *testing.T) {
 	inspect := inspector.New(netFiles)
 
@@ -132,7 +132,7 @@ var _ i13[i14, i15]
 	}
 }
 
-// TestPruning compares Inspector against ast.Inspect,
+// TestInspectPruning compares Inspector against ast.Inspect,
 // pruning descent within ast.CallExpr nodes.
 func TestInspectPruning(t *testing.T) {
 	inspect := inspector.New(netFiles)
@@ -160,7 +160,8 @@ func TestInspectPruning(t *testing.T) {
 	compare(t, nodesA, nodesB)
 }
 
-func compare(t *testing.T, nodesA, nodesB []ast.Node) {
+// compare calls t.Error if !slices.Equal(nodesA, nodesB).
+func compare[N comparable](t *testing.T, nodesA, nodesB []N) {
 	if len(nodesA) != len(nodesB) {
 		t.Errorf("inconsistent node lists: %d vs %d", len(nodesA), len(nodesB))
 	} else {

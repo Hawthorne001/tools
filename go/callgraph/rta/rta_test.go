@@ -12,7 +12,6 @@ package rta_test
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/types"
 	"sort"
 	"strings"
@@ -20,39 +19,62 @@ import (
 
 	"golang.org/x/tools/go/callgraph"
 	"golang.org/x/tools/go/callgraph/rta"
-	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
-	"golang.org/x/tools/internal/aliases"
+	"golang.org/x/tools/internal/testfiles"
+	"golang.org/x/tools/txtar"
 )
 
-// TestRTA runs RTA on each testdata/*.go file and compares the
-// results with the expectations expressed in the WANT comment.
+// TestRTA runs RTA on each testdata/*.txtar file containing a single
+// go file in a single package or multiple files in different packages,
+// and compares the results with the expectations expressed in the WANT
+// comment.
 func TestRTA(t *testing.T) {
-	filenames := []string{
-		"testdata/func.go",
-		"testdata/generics.go",
-		"testdata/iface.go",
-		"testdata/reflectcall.go",
-		"testdata/rtype.go",
+	archivePaths := []string{
+		"testdata/func.txtar",
+		"testdata/generics.txtar",
+		"testdata/iface.txtar",
+		"testdata/reflectcall.txtar",
+		"testdata/rtype.txtar",
+		"testdata/multipkgs.txtar",
 	}
-	for _, filename := range filenames {
-		t.Run(filename, func(t *testing.T) {
-			// Load main program and build SSA.
-			// TODO(adonovan): use go/packages instead.
-			conf := loader.Config{ParserMode: parser.ParseComments}
-			f, err := conf.ParseFile(filename, nil)
+	for _, archive := range archivePaths {
+		t.Run(archive, func(t *testing.T) {
+			ar, err := txtar.ParseFile(archive)
 			if err != nil {
 				t.Fatal(err)
 			}
-			conf.CreateFromFiles("main", f)
-			lprog, err := conf.Load()
-			if err != nil {
-				t.Fatal(err)
+
+			pkgs := testfiles.LoadPackages(t, ar, "./...")
+
+			// find the file which contains the expected result
+			var f *ast.File
+			for _, p := range pkgs {
+				// We assume the packages have a single file or
+				// the wanted result is in the first file of the main package.
+				if p.Name == "main" {
+					f = p.Syntax[0]
+				}
 			}
-			prog := ssautil.CreateProgram(lprog, ssa.InstantiateGenerics)
+			if f == nil {
+				t.Fatalf("failed to find the file with expected result within main package %s", archive)
+			}
+
+			prog, spkgs := ssautil.Packages(pkgs, ssa.SanityCheckFunctions|ssa.InstantiateGenerics)
+
+			// find the main package to get functions for rta analysis
+			var mainPkg *ssa.Package
+			for _, sp := range spkgs {
+				if sp.Pkg.Name() == "main" {
+					mainPkg = sp
+					break
+				}
+			}
+			if mainPkg == nil {
+				t.Fatalf("failed to find main ssa package %s", archive)
+			}
+
 			prog.Build()
-			mainPkg := prog.Package(lprog.Created[0].Pkg)
 
 			res := rta.Analyze([]*ssa.Function{
 				mainPkg.Func("main"),
@@ -78,7 +100,7 @@ func TestRTA(t *testing.T) {
 //
 // Functions are notated as if by ssa.Function.String.
 func check(t *testing.T, f *ast.File, pkg *ssa.Package, res *rta.Result) {
-	tokFile := pkg.Prog.Fset.File(f.Pos())
+	tokFile := pkg.Prog.Fset.File(f.FileStart)
 
 	// Find the WANT comment.
 	expectation := func(f *ast.File) (string, int) {
@@ -201,7 +223,7 @@ func check(t *testing.T, f *ast.File, pkg *ssa.Package, res *rta.Result) {
 		got := make(stringset)
 		res.RuntimeTypes.Iterate(func(key types.Type, value interface{}) {
 			if !value.(bool) { // accessible to reflection
-				typ := types.TypeString(aliases.Unalias(key), types.RelativeTo(pkg.Pkg))
+				typ := types.TypeString(types.Unalias(key), types.RelativeTo(pkg.Pkg))
 				got[typ] = true
 			}
 		})

@@ -11,40 +11,34 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/gopls/internal/cache/parsego"
-	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 )
 
-// ConvertStringLiteral reports whether we can convert between raw and interpreted
-// string literals in the [start, end), along with a CodeAction containing the edits.
+// convertStringLiteral reports whether we can convert between raw and interpreted
+// string literals in the [start, end) range, along with a CodeAction containing the edits.
 //
 // Only the following conditions are true, the action in result is valid
 //   - [start, end) is enclosed by a string literal
 //   - if the string is interpreted string, need check whether the convert is allowed
-func ConvertStringLiteral(pgf *parsego.File, fh file.Handle, rng protocol.Range) (protocol.CodeAction, bool) {
-	startPos, endPos, err := pgf.RangePos(rng)
-	if err != nil {
-		return protocol.CodeAction{}, false // e.g. invalid range
-	}
-	path, _ := astutil.PathEnclosingInterval(pgf.File, startPos, endPos)
+func convertStringLiteral(req *codeActionsRequest) {
+	path, _ := astutil.PathEnclosingInterval(req.pgf.File, req.start, req.end)
 	lit, ok := path[0].(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
-		return protocol.CodeAction{}, false
+		return
 	}
 
 	str, err := strconv.Unquote(lit.Value)
 	if err != nil {
-		return protocol.CodeAction{}, false
+		return
 	}
 
 	interpreted := lit.Value[0] == '"'
 	// Not all "..." strings can be represented as `...` strings.
 	if interpreted && !strconv.CanBackquote(strings.ReplaceAll(str, "\n", "")) {
-		return protocol.CodeAction{}, false
+		return
 	}
 
 	var (
@@ -59,27 +53,20 @@ func ConvertStringLiteral(pgf *parsego.File, fh file.Handle, rng protocol.Range)
 		newText = strconv.Quote(str)
 	}
 
-	start, end, err := safetoken.Offsets(pgf.Tok, lit.Pos(), lit.End())
+	start, end, err := safetoken.Offsets(req.pgf.Tok, lit.Pos(), lit.End())
 	if err != nil {
 		bug.Reportf("failed to get string literal offset by token.Pos:%v", err)
-		return protocol.CodeAction{}, false
+		return
 	}
 	edits := []diff.Edit{{
 		Start: start,
 		End:   end,
 		New:   newText,
 	}}
-	pedits, err := protocol.EditsFromDiffEdits(pgf.Mapper, edits)
+	textedits, err := protocol.EditsFromDiffEdits(req.pgf.Mapper, edits)
 	if err != nil {
 		bug.Reportf("failed to convert diff.Edit to protocol.TextEdit:%v", err)
-		return protocol.CodeAction{}, false
+		return
 	}
-
-	return protocol.CodeAction{
-		Title: title,
-		Kind:  protocol.RefactorRewrite,
-		Edit: &protocol.WorkspaceEdit{
-			DocumentChanges: documentChanges(fh, pedits),
-		},
-	}, true
+	req.addEditAction(title, nil, protocol.DocumentChangeEdit(req.fh, textedits))
 }

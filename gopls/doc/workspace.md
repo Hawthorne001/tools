@@ -1,4 +1,4 @@
-# Setting up your workspace
+# Gopls: Setting up your workspace
 
 In the language server protocol, a "workspace" consists of a folder along with
 per-folder configuration. Some LSP clients such as VS Code allow configuring
@@ -121,9 +121,9 @@ match the system default operating system (`GOOS`) or architecture (`GOARCH`).
 However, per the caveats listed in that section, this automatic behavior comes
 with limitations. Customize your gopls environment by setting `GOOS` or
 `GOARCH` in your
-[`"build.env"`](https://github.com/golang/tools/blob/master/gopls/doc/settings.md#env-mapstringstring)
+[`"build.env"`](https://github.com/golang/tools/blob/master/gopls/doc/settings.md#env)
 or `-tags=...` in your"
-["build.buildFlags"](https://github.com/golang/tools/blob/master/gopls/doc/settings.md#buildflags-string)
+["build.buildFlags"](https://github.com/golang/tools/blob/master/gopls/doc/settings.md#buildflags)
 when:
 
 - You want to modify the default build environment.

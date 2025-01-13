@@ -45,10 +45,11 @@ type Package struct {
 	PkgPath PackagePath
 	Name    PackageName
 
-	// these three fields are as defined by go/packages.Package
+	// These fields are as defined by go/packages.Package
 	GoFiles         []protocol.DocumentURI
 	CompiledGoFiles []protocol.DocumentURI
 	IgnoredFiles    []protocol.DocumentURI
+	OtherFiles      []protocol.DocumentURI
 
 	ForTest       PackagePath // q in a "p [q.test]" package, else ""
 	TypesSizes    types.Sizes
@@ -154,7 +155,7 @@ func (mp *Package) String() string { return string(mp.ID) }
 // to discard them before requesting type checking, or the products of
 // type-checking such as the cross-reference index or method set index.
 //
-// MetadataForFile doesn't do this filtering itself becaused in some
+// MetadataForFile doesn't do this filtering itself because in some
 // cases we need to make a reverse dependency query on the metadata
 // graph, and it's important to include the rdeps of ITVs in that
 // query. But the filtering of ITVs should be applied after that step,
@@ -166,9 +167,6 @@ func (mp *Package) IsIntermediateTestVariant() bool {
 }
 
 // A Source maps package IDs to metadata for the packages.
-//
-// TODO(rfindley): replace this with a concrete metadata graph, once it is
-// exposed from the snapshot.
 type Source interface {
 	// Metadata returns the [Package] for the given package ID, or nil if it does
 	// not exist.
@@ -236,19 +234,23 @@ func RemoveIntermediateTestVariants(pmetas *[]*Package) {
 	*pmetas = res
 }
 
-// IsValidImport returns whether importPkgPath is importable
-// by pkgPath.
-func IsValidImport(pkgPath, importPkgPath PackagePath) bool {
-	i := strings.LastIndex(string(importPkgPath), "/internal/")
+// IsValidImport returns whether from may import to.
+func IsValidImport(from, to PackagePath, goList bool) bool {
+	// If the metadata came from a build system other than go list
+	// (e.g. bazel) it is beyond our means to compute visibility.
+	if !goList {
+		return true
+	}
+	i := strings.LastIndex(string(to), "/internal/")
 	if i == -1 {
 		return true
 	}
 	// TODO(rfindley): this looks wrong: IsCommandLineArguments is meant to
 	// operate on package IDs, not package paths.
-	if IsCommandLineArguments(PackageID(pkgPath)) {
+	if IsCommandLineArguments(PackageID(from)) {
 		return true
 	}
 	// TODO(rfindley): this is wrong. mod.testx/p should not be able to
 	// import mod.test/internal: https://go.dev/play/p/-Ca6P-E4V4q
-	return strings.HasPrefix(string(pkgPath), string(importPkgPath[:i]))
+	return strings.HasPrefix(string(from), string(to[:i]))
 }

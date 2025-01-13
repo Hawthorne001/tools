@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"golang.org/x/tools/gopls/internal/cmd"
-	"golang.org/x/tools/gopls/internal/hooks"
 	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
@@ -43,6 +42,7 @@ var (
 	cpuProfile   = flag.String("gopls_cpuprofile", "", "if set, the cpu profile file suffix; see \"Profiling\" in the package doc")
 	memProfile   = flag.String("gopls_memprofile", "", "if set, the mem profile file suffix; see \"Profiling\" in the package doc")
 	allocProfile = flag.String("gopls_allocprofile", "", "if set, the alloc profile file suffix; see \"Profiling\" in the package doc")
+	blockProfile = flag.String("gopls_blockprofile", "", "if set, the block profile file suffix; see \"Profiling\" in the package doc")
 	trace        = flag.String("gopls_trace", "", "if set, the trace file suffix; see \"Profiling\" in the package doc")
 
 	// If non-empty, tempDir is a temporary working dir that was created by this
@@ -57,7 +57,7 @@ const runAsGopls = "_GOPLS_BENCH_RUN_AS_GOPLS"
 func TestMain(m *testing.M) {
 	bug.PanicOnBugs = true
 	if os.Getenv(runAsGopls) == "true" {
-		tool.Main(context.Background(), cmd.New(hooks.Options), os.Args[1:])
+		tool.Main(context.Background(), cmd.New(), os.Args[1:])
 		os.Exit(0)
 	}
 	event.SetExporter(nil) // don't log to stderr
@@ -119,8 +119,7 @@ func connectEditor(dir string, config fake.EditorConfig, ts servertest.Connector
 	}
 
 	a := integration.NewAwaiter(s.Workdir)
-	const skipApplyEdits = false
-	editor, err := fake.NewEditor(s, config).Connect(context.Background(), ts, a.Hooks(), skipApplyEdits)
+	editor, err := fake.NewEditor(s, config).Connect(context.Background(), ts, a.Hooks())
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -178,6 +177,9 @@ func profileArgs(name string, wantCPU bool) []string {
 	}
 	if *allocProfile != "" {
 		args = append(args, fmt.Sprintf("-profile.alloc=%s", qualifiedName(name, *allocProfile)))
+	}
+	if *blockProfile != "" {
+		args = append(args, fmt.Sprintf("-profile.block=%s", qualifiedName(name, *blockProfile)))
 	}
 	if *trace != "" {
 		args = append(args, fmt.Sprintf("-profile.trace=%s", qualifiedName(name, *trace)))
@@ -290,7 +292,7 @@ func (s *SidecarServer) Connect(ctx context.Context) jsonrpc2.Conn {
 // the profile is written to a temp file that is deleted after the cpu_seconds
 // metric has been computed.
 func startProfileIfSupported(b *testing.B, env *integration.Env, name string) func() {
-	if !env.Editor.HasCommand(command.StartProfile.ID()) {
+	if !env.Editor.HasCommand(command.StartProfile) {
 		return nil
 	}
 	b.StopTimer()
@@ -304,18 +306,19 @@ func startProfileIfSupported(b *testing.B, env *integration.Env, name string) fu
 			b.Fatalf("reading profile: %v", err)
 		}
 		b.ReportMetric(totalCPU.Seconds()/float64(b.N), "cpu_seconds/op")
-		if *cpuProfile == "" {
-			// The user didn't request profiles, so delete it to clean up.
-			if err := os.Remove(profFile); err != nil {
-				b.Errorf("removing profile file: %v", err)
+		if *cpuProfile != "" {
+			// Read+write to avoid exdev errors.
+			data, err := os.ReadFile(profFile)
+			if err != nil {
+				b.Fatalf("reading profile: %v", err)
 			}
-		} else {
-			// NOTE: if this proves unreliable (due to e.g. EXDEV), we can fall back
-			// on Read+Write+Remove.
 			name := qualifiedName(name, *cpuProfile)
-			if err := os.Rename(profFile, name); err != nil {
-				b.Fatalf("renaming profile file: %v", err)
+			if err := os.WriteFile(name, data, 0666); err != nil {
+				b.Fatalf("writing profile: %v", err)
 			}
+		}
+		if err := os.Remove(profFile); err != nil {
+			b.Errorf("removing profile file: %v", err)
 		}
 	}
 }

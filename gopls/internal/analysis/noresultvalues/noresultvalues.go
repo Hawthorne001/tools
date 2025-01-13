@@ -27,7 +27,7 @@ var Analyzer = &analysis.Analyzer{
 	Requires:         []*analysis.Analyzer{inspect.Analyzer},
 	Run:              run,
 	RunDespiteErrors: true,
-	URL:              "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/noresultvars",
+	URL:              "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/noresultvalues",
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -42,7 +42,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 		var file *ast.File
 		for _, f := range pass.Files {
-			if f.Pos() <= retStmt.Pos() && retStmt.Pos() < f.End() {
+			if f.FileStart <= retStmt.Pos() && retStmt.Pos() < f.FileEnd {
 				file = f
 				break
 			}

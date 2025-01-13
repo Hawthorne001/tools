@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/label"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/event/keys"
-	"golang.org/x/tools/internal/event/tag"
 	"golang.org/x/tools/internal/imports"
+	"golang.org/x/tools/internal/modindex"
 )
 
 // refreshTimer implements delayed asynchronous refreshing of state.
@@ -35,6 +36,18 @@ func newRefreshTimer(refresh func()) *refreshTimer {
 	}
 }
 
+// stop stops any future scheduled refresh.
+func (t *refreshTimer) stop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.timer != nil {
+		t.timer.Stop()
+		t.timer = nil
+		t.refreshFn = nil // release resources
+	}
+}
+
 // schedule schedules the refresh function to run at some point in the future,
 // if no existing refresh is already scheduled.
 //
@@ -47,18 +60,20 @@ func (t *refreshTimer) schedule() {
 
 	if t.timer == nil {
 		// Don't refresh more than twice per minute.
-		delay := 30 * time.Second
 		// Don't spend more than ~2% of the time refreshing.
-		if adaptive := 50 * t.duration; adaptive > delay {
-			delay = adaptive
-		}
+		delay := max(30*time.Second, 50*t.duration)
 		t.timer = time.AfterFunc(delay, func() {
 			start := time.Now()
-			t.refreshFn()
 			t.mu.Lock()
-			t.duration = time.Since(start)
-			t.timer = nil
+			refreshFn := t.refreshFn
 			t.mu.Unlock()
+			if refreshFn != nil { // timer may be stopped.
+				refreshFn()
+				t.mu.Lock()
+				t.duration = time.Since(start)
+				t.timer = nil
+				t.mu.Unlock()
+			}
 		})
 	}
 }
@@ -70,7 +85,8 @@ func (t *refreshTimer) schedule() {
 type sharedModCache struct {
 	mu     sync.Mutex
 	caches map[string]*imports.DirInfoCache // GOMODCACHE -> cache content; never invalidated
-	timers map[string]*refreshTimer         // GOMODCACHE -> timer
+	// TODO(rfindley): consider stopping these timers when the session shuts down.
+	timers map[string]*refreshTimer // GOMODCACHE -> timer
 }
 
 func (c *sharedModCache) dirCache(dir string) *imports.DirInfoCache {
@@ -95,7 +111,7 @@ func (c *sharedModCache) refreshDir(ctx context.Context, dir string, logf func(s
 	timer, ok := c.timers[dir]
 	if !ok {
 		timer = newRefreshTimer(func() {
-			_, done := event.Start(ctx, "cache.sharedModCache.refreshDir", tag.Directory.Of(dir))
+			_, done := event.Start(ctx, "cache.sharedModCache.refreshDir", label.Directory.Of(dir))
 			defer done()
 			imports.ScanModuleCache(dir, cache, logf)
 		})
@@ -119,8 +135,7 @@ type importsState struct {
 // newImportsState constructs a new imports state for running goimports
 // functions via [runProcessEnvFunc].
 //
-// The returned state will automatically refresh itself following a call to
-// runProcessEnvFunc.
+// The returned state will automatically refresh itself following a delay.
 func newImportsState(backgroundCtx context.Context, modCache *sharedModCache, env *imports.ProcessEnv) *importsState {
 	s := &importsState{
 		ctx:        backgroundCtx,
@@ -128,7 +143,48 @@ func newImportsState(backgroundCtx context.Context, modCache *sharedModCache, en
 		processEnv: env,
 	}
 	s.refreshTimer = newRefreshTimer(s.refreshProcessEnv)
+	s.refreshTimer.schedule()
 	return s
+}
+
+// modcacheState holds a modindex.Index and controls its updates
+type modcacheState struct {
+	dir          string // GOMODCACHE
+	refreshTimer *refreshTimer
+	mu           sync.Mutex
+	index        *modindex.Index
+}
+
+// newModcacheState constructs a new modcacheState for goimports.
+// The returned state is automatically updated until [modcacheState.stopTimer] is called.
+func newModcacheState(dir string) *modcacheState {
+	s := &modcacheState{
+		dir: dir,
+	}
+	s.index, _ = modindex.ReadIndex(dir)
+	s.refreshTimer = newRefreshTimer(s.refreshIndex)
+	go s.refreshIndex()
+	return s
+}
+
+func (s *modcacheState) refreshIndex() {
+	ok, err := modindex.Update(s.dir)
+	if err != nil || !ok {
+		return
+	}
+	// read the new index
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.index, _ = modindex.ReadIndex(s.dir)
+}
+
+func (s *modcacheState) stopTimer() {
+	s.refreshTimer.stop()
+}
+
+// stopTimer stops scheduled refreshes of this imports state.
+func (s *importsState) stopTimer() {
+	s.refreshTimer.stop()
 }
 
 // runProcessEnvFunc runs goimports.
@@ -210,20 +266,22 @@ func (s *importsState) refreshProcessEnv() {
 	resolver, err := s.processEnv.GetResolver()
 	s.mu.Unlock()
 	if err != nil {
+		event.Error(s.ctx, "failed to get import resolver", err)
 		return
 	}
 
 	event.Log(s.ctx, "background imports cache refresh starting")
+	resolver2 := resolver.ClearForNewScan()
 
 	// Prime the new resolver before updating the processEnv, so that gopls
 	// doesn't wait on an unprimed cache.
-	if err := imports.PrimeCache(context.Background(), resolver); err == nil {
+	if err := imports.PrimeCache(context.Background(), resolver2); err == nil {
 		event.Log(ctx, fmt.Sprintf("background refresh finished after %v", time.Since(start)))
 	} else {
 		event.Log(ctx, fmt.Sprintf("background refresh finished after %v", time.Since(start)), keys.Err.Of(err))
 	}
 
 	s.mu.Lock()
-	s.processEnv.UpdateResolver(resolver)
+	s.processEnv.UpdateResolver(resolver2)
 	s.mu.Unlock()
 }

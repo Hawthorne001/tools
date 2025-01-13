@@ -28,6 +28,7 @@ import (
 	"golang.org/x/tools/gopls/internal/progress"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/settings"
+	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/internal/event"
 )
 
@@ -93,7 +94,7 @@ type server struct {
 
 	// folders is only valid between initialize and initialized, and holds the
 	// set of folders to build views for when we are ready.
-	// Each has a valid, non-empty 'file'-scheme URI.
+	// Only the valid, non-empty 'file'-scheme URIs will be added.
 	pendingFolders []protocol.WorkspaceFolder
 
 	// watchedGlobPatterns is the set of glob patterns that we have requested
@@ -104,7 +105,7 @@ type server struct {
 	watchedGlobPatterns    map[protocol.RelativePattern]unit
 	watchRegistrationCount int
 
-	diagnosticsMu sync.Mutex
+	diagnosticsMu sync.Mutex // guards map and its values
 	diagnostics   map[protocol.DocumentURI]*fileDiagnostics
 
 	// diagnosticsSema limits the concurrency of diagnostics runs, which can be
@@ -204,6 +205,8 @@ func (s *server) WorkDoneProgressCancel(ctx context.Context, params *protocol.Wo
 //
 //	open?file=%s&line=%d&col=%d       - open a file
 //	pkg/PKGPATH?view=%s               - show doc for package in a given view
+//	assembly?pkg=%s&view=%s&symbol=%s - show assembly of specified func symbol
+//	freesymbols?file=%s&range=%d:%d:%d:%d:&view=%s - show report of free symbols
 type web struct {
 	server *http.Server
 	addr   url.URL // "http://127.0.0.1:PORT/gopls/SECRET"
@@ -263,7 +266,7 @@ func (s *server) initWeb() (*web, error) {
 
 	secret := "/gopls/" + base64.RawURLEncoding.EncodeToString(token)
 	webMux := http.NewServeMux()
-	rootMux.Handle(secret+"/", http.StripPrefix(secret, webMux))
+	rootMux.Handle(secret+"/", withPanicHandler(http.StripPrefix(secret, webMux)))
 
 	webServer := &http.Server{Addr: listener.Addr().String(), Handler: rootMux}
 	go func() {
@@ -283,9 +286,9 @@ func (s *server) initWeb() (*web, error) {
 		mux:    webMux,
 	}
 
-	// The /open handler allows the browser to request that the
-	// LSP client editor open a file; see web.urlToOpen.
-	webMux.HandleFunc("/open", func(w http.ResponseWriter, req *http.Request) {
+	// The /src handler allows the browser to request that the
+	// LSP client editor open a file; see web.SrcURL.
+	webMux.HandleFunc("/src", func(w http.ResponseWriter, req *http.Request) {
 		if err := req.ParseForm(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -300,7 +303,7 @@ func (s *server) initWeb() (*web, error) {
 		openClientEditor(req.Context(), s.client, protocol.Location{
 			URI:   uri,
 			Range: protocol.Range{Start: posn, End: posn},
-		})
+		}, s.Options())
 	})
 
 	// The /pkg/PATH&view=... handler shows package documentation for PATH.
@@ -314,7 +317,7 @@ func (s *server) initWeb() (*web, error) {
 		// Get snapshot of specified view.
 		view, err := s.session.View(req.Form.Get("view"))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
 		snapshot, release, err := view.Snapshot()
@@ -344,16 +347,113 @@ func (s *server) initWeb() (*web, error) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		pkgURL := func(path golang.PackagePath, fragment string) protocol.URI {
-			return web.pkgURL(view, path, fragment)
-		}
-		content, err := golang.RenderPackageDoc(pkgs[0], web.openURL, pkgURL)
+		content, err := golang.PackageDocHTML(view.ID(), pkgs[0], web)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Write(content)
 	})))
+
+	// The /freesymbols?file=...&range=...&view=... handler shows
+	// free symbols referenced by the selection.
+	webMux.HandleFunc("/freesymbols", func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		if err := req.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Get snapshot of specified view.
+		view, err := s.session.View(req.Form.Get("view"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		snapshot, release, err := view.Snapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer release()
+
+		// Get selection range and type-check.
+		loc := protocol.Location{
+			URI: protocol.DocumentURI(req.Form.Get("file")),
+		}
+		if _, err := fmt.Sscanf(req.Form.Get("range"), "%d:%d:%d:%d",
+			&loc.Range.Start.Line,
+			&loc.Range.Start.Character,
+			&loc.Range.End.Line,
+			&loc.Range.End.Character,
+		); err != nil {
+			http.Error(w, "invalid range", http.StatusInternalServerError)
+			return
+		}
+		pkg, pgf, err := golang.NarrowestPackageForFile(ctx, snapshot, loc.URI)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		start, end, err := pgf.RangePos(loc.Range)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		// Produce report.
+		html := golang.FreeSymbolsHTML(view.ID(), pkg, pgf, start, end, web)
+		w.Write(html)
+	})
+
+	// The /assembly?pkg=...&view=...&symbol=... handler shows
+	// the assembly of the current function.
+	webMux.HandleFunc("/assembly", func(w http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		if err := req.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		// Get parameters.
+		var (
+			viewID = req.Form.Get("view")
+			pkgID  = metadata.PackageID(req.Form.Get("pkg"))
+			symbol = req.Form.Get("symbol")
+		)
+		if viewID == "" || pkgID == "" || symbol == "" {
+			http.Error(w, "/assembly requires view, pkg, symbol", http.StatusBadRequest)
+			return
+		}
+
+		// Get snapshot of specified view.
+		view, err := s.session.View(viewID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		snapshot, release, err := view.Snapshot()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer release()
+
+		pkgs, err := snapshot.TypeCheck(ctx, pkgID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		pkg := pkgs[0]
+
+		// Produce report.
+		html, err := golang.AssemblyHTML(ctx, snapshot, pkg, symbol, web)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write(html)
+	})
 
 	return web, nil
 }
@@ -363,27 +463,53 @@ func (s *server) initWeb() (*web, error) {
 //go:embed assets/*
 var assets embed.FS
 
-// openURL returns an /open URL that, when visited, causes the client
+// SrcURL returns a /src URL that, when visited, causes the client
 // editor to open the specified file/line/column (in 1-based UTF-8
 // coordinates).
 //
 // (Rendering may generate hundreds of positions across files of many
 // packages, so don't convert to LSP coordinates yet: wait until the
 // URL is opened.)
-func (w *web) openURL(filename string, line, col8 int) protocol.URI {
+func (w *web) SrcURL(filename string, line, col8 int) protocol.URI {
 	return w.url(
-		"open",
+		"src",
 		fmt.Sprintf("file=%s&line=%d&col=%d", url.QueryEscape(filename), line, col8),
 		"")
 }
 
-// pkgURL returns a /pkg URL for the documentation of the specified package.
+// PkgURL returns a /pkg URL for the documentation of the specified package.
 // The optional fragment must be of the form "Println" or "Buffer.WriteString".
-func (w *web) pkgURL(v *cache.View, path golang.PackagePath, fragment string) protocol.URI {
+func (w *web) PkgURL(viewID string, path golang.PackagePath, fragment string) protocol.URI {
 	return w.url(
 		"pkg/"+string(path),
-		"view="+url.QueryEscape(v.ID()),
+		"view="+url.QueryEscape(viewID),
 		fragment)
+}
+
+// freesymbolsURL returns a /freesymbols URL for a report
+// on the free symbols referenced within the selection span (loc).
+func (w *web) freesymbolsURL(viewID string, loc protocol.Location) protocol.URI {
+	return w.url(
+		"freesymbols",
+		fmt.Sprintf("file=%s&range=%d:%d:%d:%d&view=%s",
+			url.QueryEscape(string(loc.URI)),
+			loc.Range.Start.Line,
+			loc.Range.Start.Character,
+			loc.Range.End.Line,
+			loc.Range.End.Character,
+			url.QueryEscape(viewID)),
+		"")
+}
+
+// assemblyURL returns the URL of an assembly listing of the specified function symbol.
+func (w *web) assemblyURL(viewID, packageID, symbol string) protocol.URI {
+	return w.url(
+		"assembly",
+		fmt.Sprintf("view=%s&pkg=%s&symbol=%s",
+			url.QueryEscape(viewID),
+			url.QueryEscape(packageID),
+			url.QueryEscape(symbol)),
+		"")
 }
 
 // url returns a URL by joining a relative path, an (encoded) query,
@@ -395,4 +521,20 @@ func (w *web) url(path, query, fragment string) protocol.URI {
 	url2.RawQuery = query
 	url2.Fragment = fragment
 	return protocol.URI(url2.String())
+}
+
+// withPanicHandler wraps an HTTP handler with telemetry-reporting of
+// panics that would otherwise be silently recovered by the net/http
+// root handler.
+func withPanicHandler(h http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		panicked := true
+		defer func() {
+			if panicked {
+				bug.Report("panic in HTTP handler")
+			}
+		}()
+		h.ServeHTTP(w, req)
+		panicked = false
+	}
 }

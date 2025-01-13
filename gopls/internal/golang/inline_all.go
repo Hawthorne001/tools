@@ -44,7 +44,7 @@ import (
 //
 // The code below notes where are assumptions are made that only hold true in
 // the case of parameter removal (annotated with 'Assumption:')
-func inlineAllCalls(ctx context.Context, logf func(string, ...any), snapshot *cache.Snapshot, pkg *cache.Package, pgf *parsego.File, origDecl *ast.FuncDecl, callee *inline.Callee, post func([]byte) []byte) (map[protocol.DocumentURI][]byte, error) {
+func inlineAllCalls(ctx context.Context, snapshot *cache.Snapshot, pkg *cache.Package, pgf *parsego.File, origDecl *ast.FuncDecl, callee *inline.Callee, post func([]byte) []byte, opts *inline.Options) (map[protocol.DocumentURI][]byte, error) {
 	// Collect references.
 	var refs []protocol.Location
 	{
@@ -112,6 +112,7 @@ func inlineAllCalls(ctx context.Context, logf func(string, ...any), snapshot *ca
 		if err != nil {
 			return nil, bug.Errorf("finding %s in %s: %v", ref.URI, refpkg.Metadata().ID, err)
 		}
+
 		start, end, err := pgf.RangePos(ref.Range)
 		if err != nil {
 			return nil, err // e.g. invalid range
@@ -124,6 +125,8 @@ func inlineAllCalls(ctx context.Context, logf func(string, ...any), snapshot *ca
 		)
 		path, _ := astutil.PathEnclosingInterval(pgf.File, start, end)
 		name, _ = path[0].(*ast.Ident)
+
+		// TODO(rfindley): handle method expressions correctly.
 		if _, ok := path[1].(*ast.SelectorExpr); ok {
 			call, _ = path[2].(*ast.CallExpr)
 		} else {
@@ -137,11 +140,30 @@ func inlineAllCalls(ctx context.Context, logf func(string, ...any), snapshot *ca
 			//    use(func(...) { f(...) })
 			return nil, fmt.Errorf("cannot inline: found non-call function reference %v", ref)
 		}
+
+		// Heuristic: ignore references that overlap with type checker errors, as they may
+		// lead to invalid results (see golang/go#70268).
+		hasTypeErrors := false
+		for _, typeErr := range refpkg.TypeErrors() {
+			if call.Lparen <= typeErr.Pos && typeErr.Pos <= call.Rparen {
+				hasTypeErrors = true
+			}
+		}
+
+		if hasTypeErrors {
+			continue
+		}
+
+		if typeutil.StaticCallee(refpkg.TypesInfo(), call) == nil {
+			continue // dynamic call
+		}
+
 		// Sanity check.
 		if obj := refpkg.TypesInfo().ObjectOf(name); obj == nil ||
 			obj.Name() != origDecl.Name.Name ||
 			obj.Pkg() == nil ||
 			obj.Pkg().Path() != string(pkg.Metadata().PkgPath) {
+
 			return nil, bug.Errorf("cannot inline: corrupted reference %v", ref)
 		}
 
@@ -193,11 +215,11 @@ func inlineAllCalls(ctx context.Context, logf func(string, ...any), snapshot *ca
 				Call:    calls[currentCall],
 				Content: content,
 			}
-			var err error
-			content, err = inline.Inline(logf, caller, callee)
+			res, err := inline.Inline(caller, callee, opts)
 			if err != nil {
 				return nil, fmt.Errorf("inlining failed: %v", err)
 			}
+			content = res.Content
 			if post != nil {
 				content = post(content)
 			}
@@ -230,6 +252,10 @@ func inlineAllCalls(ctx context.Context, logf func(string, ...any), snapshot *ca
 			// anything in the surrounding scope.
 			//
 			// TODO(rfindley): improve this.
+			logf := func(string, ...any) {}
+			if opts != nil {
+				logf = opts.Logf
+			}
 			tpkg, tinfo, err = reTypeCheck(logf, callInfo.pkg, map[protocol.DocumentURI]*ast.File{uri: file}, true)
 			if err != nil {
 				return nil, bug.Errorf("type checking after inlining failed: %v", err)

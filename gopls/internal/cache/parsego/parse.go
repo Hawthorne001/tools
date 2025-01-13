@@ -2,6 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:generate go run resolver_gen.go
+
+// The parsego package defines the [File] type, a wrapper around a go/ast.File
+// that is useful for answering LSP queries. Notably, it bundles the
+// *token.File and *protocol.Mapper necessary for token.Pos locations to and
+// from UTF-16 LSP positions.
+//
+// Run `go generate` to update resolver.go from GOROOT.
 package parsego
 
 import (
@@ -13,13 +21,15 @@ import (
 	"go/scanner"
 	"go/token"
 	"reflect"
+	"slices"
 
+	"golang.org/x/tools/gopls/internal/label"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/astutil"
+	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/event/tag"
 )
 
 // Common parse modes; these should be reused wherever possible to increase
@@ -42,7 +52,7 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 	if purgeFuncBodies {
 		src = astutil.PurgeFuncBodies(src)
 	}
-	ctx, done := event.Start(ctx, "cache.ParseGoSrc", tag.File.Of(uri.Path()))
+	ctx, done := event.Start(ctx, "cache.ParseGoSrc", label.File.Of(uri.Path()))
 	defer done()
 
 	file, err := parser.ParseFile(fset, uri.Path(), src, mode)
@@ -51,15 +61,44 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 		// We passed a byte slice, so the only possible error is a parse error.
 		parseErr = err.(scanner.ErrorList)
 	}
+	// Inv: file != nil.
 
-	tok := fset.File(file.Pos())
-	if tok == nil {
-		// file.Pos is the location of the package declaration (issue #53202). If there was
-		// none, we can't find the token.File that ParseFile created, and we
-		// have no choice but to recreate it.
-		tok = fset.AddFile(uri.Path(), -1, len(src))
-		tok.SetLinesForContent(src)
+	// Workaround for #70162 (missing File{Start,End} when
+	// parsing empty file) with go1.23.
+	//
+	// When parsing an empty file, or one without a valid
+	// package declaration, the go1.23 parser bails out before
+	// setting FileStart and End.
+	//
+	// This leaves us no way to find the original
+	// token.File that ParseFile created, so as a
+	// workaround, we recreate the token.File, and
+	// populate the FileStart and FileEnd fields.
+	//
+	// See also #53202.
+	tokenFile := func(file *ast.File) *token.File {
+		tok := fset.File(file.FileStart)
+		if tok == nil {
+			// Invalid File.FileStart (also File.{Package,Name.Pos}).
+			if file.Package.IsValid() {
+				bug.Report("ast.File has valid Package but no FileStart")
+			}
+			if file.Name.Pos().IsValid() {
+				bug.Report("ast.File has valid Name.Pos but no FileStart")
+			}
+			tok = fset.AddFile(uri.Path(), -1, len(src))
+			tok.SetLinesForContent(src)
+			// If the File contained any valid token.Pos values,
+			// they would all be invalid wrt the new token.File,
+			// but we have established that it lacks FileStart,
+			// Package, and Name.Pos.
+			file.FileStart = token.Pos(tok.Base())
+			file.FileEnd = token.Pos(tok.Base() + tok.Size())
+		}
+		return tok
 	}
+
+	tok := tokenFile(file)
 
 	fixedSrc := false
 	fixedAST := false
@@ -84,19 +123,17 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 			// of the last changes we made to aid in debugging.
 			if i == 9 {
 				unified := diff.Unified("before", "after", string(src), string(newSrc))
-				event.Log(ctx, fmt.Sprintf("fixSrc loop - last diff:\n%v", unified), tag.File.Of(tok.Name()))
+				event.Log(ctx, fmt.Sprintf("fixSrc loop - last diff:\n%v", unified), label.File.Of(tok.Name()))
 			}
 
 			newFile, newErr := parser.ParseFile(fset, uri.Path(), newSrc, mode)
-			if newFile == nil {
-				break // no progress
-			}
+			assert(newFile != nil, "ParseFile returned nil") // I/O error can't happen
 
 			// Maintain the original parseError so we don't try formatting the
 			// doctored file.
 			file = newFile
 			src = newSrc
-			tok = fset.File(file.Pos())
+			tok = tokenFile(file)
 
 			// Only now that we accept the fix do we record the src fix from above.
 			fixes = append(fixes, srcFix)
@@ -114,6 +151,7 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 			}
 		}
 	}
+	assert(file != nil, "nil *ast.File")
 
 	return &File{
 		URI:      uri,
@@ -592,27 +630,17 @@ func readKeyword(pos token.Pos, tok *token.File, src []byte) string {
 func fixArrayType(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte) bool {
 	// Our expected input is a bad expression that looks like "[]someExpr".
 
-	from := bad.Pos()
-	to := bad.End()
-
-	if !from.IsValid() || !to.IsValid() {
-		return false
-	}
-
-	exprBytes := make([]byte, 0, int(to-from)+3)
-	// Avoid doing tok.Offset(to) since that panics if badExpr ends at EOF.
-	// It also panics if the position is not in the range of the file, and
-	// badExprs may not necessarily have good positions, so check first.
-	fromOffset, toOffset, err := safetoken.Offsets(tok, from, to-1)
+	from, to := bad.Pos(), bad.End()
+	fromOffset, toOffset, err := safetoken.Offsets(tok, from, to)
 	if err != nil {
 		return false
 	}
-	exprBytes = append(exprBytes, src[fromOffset:toOffset+1]...)
-	exprBytes = bytes.TrimSpace(exprBytes)
+
+	exprBytes := bytes.TrimSpace(slices.Clone(src[fromOffset:toOffset]))
 
 	// If our expression ends in "]" (e.g. "[]"), add a phantom selector
 	// so we can complete directly after the "[]".
-	if len(exprBytes) > 0 && exprBytes[len(exprBytes)-1] == ']' {
+	if bytes.HasSuffix(exprBytes, []byte("]")) {
 		exprBytes = append(exprBytes, '_')
 	}
 
@@ -824,7 +852,7 @@ func parseStmt(tok *token.File, pos token.Pos, src []byte) (ast.Stmt, error) {
 
 	// Use ParseFile instead of ParseExpr because ParseFile has
 	// best-effort behavior, whereas ParseExpr fails hard on any error.
-	fakeFile, err := parser.ParseFile(token.NewFileSet(), "", fileSrc, 0)
+	fakeFile, err := parser.ParseFile(token.NewFileSet(), "", fileSrc, parser.SkipObjectResolution)
 	if fakeFile == nil {
 		return nil, fmt.Errorf("error reading fake file source: %v", err)
 	}

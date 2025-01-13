@@ -10,11 +10,13 @@ import (
 	"go/scanner"
 	"go/token"
 	"go/types"
+	"slices"
 	"sync"
 
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/methodsets"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
+	"golang.org/x/tools/gopls/internal/cache/testfuncs"
 	"golang.org/x/tools/gopls/internal/cache/xrefs"
 	"golang.org/x/tools/gopls/internal/protocol"
 )
@@ -60,6 +62,9 @@ type syntaxPackage struct {
 
 	methodsetsOnce sync.Once
 	_methodsets    *methodsets.Index // only used by the methodsets method
+
+	testsOnce sync.Once
+	_tests    *testfuncs.Index // only used by the tests method
 }
 
 func (p *syntaxPackage) xrefs() []byte {
@@ -74,6 +79,21 @@ func (p *syntaxPackage) methodsets() *methodsets.Index {
 		p._methodsets = methodsets.NewIndex(p.fset, p.types)
 	})
 	return p._methodsets
+}
+
+func (p *syntaxPackage) tests() *testfuncs.Index {
+	p.testsOnce.Do(func() {
+		p._tests = testfuncs.NewIndex(p.compiledGoFiles, p.typesInfo)
+	})
+	return p._tests
+}
+
+// hasFixedFiles reports whether there are any 'fixed' compiled go files in the
+// package.
+//
+// Intended to be used to refine bug reports.
+func (p *syntaxPackage) hasFixedFiles() bool {
+	return slices.ContainsFunc(p.compiledGoFiles, (*parsego.File).Fixed)
 }
 
 func (p *Package) String() string { return string(p.metadata.ID) }

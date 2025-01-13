@@ -38,15 +38,12 @@ func main() {
 
 	Run(t, "", func(t *testing.T, env *Env) {
 		env.CreateBuffer("main.go", before)
-		cmd, err := command.NewAddImportCommand("Add Import", command.AddImportArgs{
+		cmd := command.NewAddImportCommand("Add Import", command.AddImportArgs{
 			URI:        env.Sandbox.Workdir.URI("main.go"),
 			ImportPath: "bytes",
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
 		env.ExecuteCommand(&protocol.ExecuteCommandParams{
-			Command:   "gopls.add_import",
+			Command:   command.AddImport.String(),
 			Arguments: cmd.Arguments,
 		}, nil)
 		got := env.BufferText("main.go")
@@ -113,15 +110,12 @@ func TestFoo2(t *testing.T) {}
 
 	Run(t, files, func(t *testing.T, env *Env) {
 		for _, tt := range tests {
-			cmd, err := command.NewListImportsCommand("List Imports", command.URIArg{
+			cmd := command.NewListImportsCommand("List Imports", command.URIArg{
 				URI: env.Sandbox.Workdir.URI(tt.filename),
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
 			var result command.ListImportsResult
 			env.ExecuteCommand(&protocol.ExecuteCommandParams{
-				Command:   command.ListImports.ID(),
+				Command:   command.ListImports.String(),
 				Arguments: cmd.Arguments,
 			}, &result)
 			if diff := cmp.Diff(tt.want, result); diff != "" {

@@ -30,7 +30,6 @@ import (
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -114,7 +113,7 @@ func handleSelectJSON(w http.ResponseWriter, req *http.Request) {
 
 	fset := pkg.Fset
 	file := pkg.Syntax[0]
-	tokFile := fset.File(file.Pos())
+	tokFile := fset.File(file.FileStart)
 	startPos := tokFile.Pos(startOffset)
 	endPos := tokFile.Pos(endOffset)
 
@@ -195,8 +194,10 @@ func handleSelectJSON(w http.ResponseWriter, req *http.Request) {
 			if tv.Value != nil {
 				fmt.Fprintf(out, ", and constant value %v", tv.Value)
 			}
-			fmt.Fprintf(out, "\n\n")
+		} else {
+			fmt.Fprintf(out, "%T has no type", innermostExpr)
 		}
+		fmt.Fprintf(out, "\n\n")
 	}
 
 	// selection x.f information (if cursor is over .f)
@@ -284,7 +285,7 @@ func formatObj(out *strings.Builder, fset *token.FileSet, ref string, obj types.
 		if obj.IsAlias() {
 			kind = "type alias"
 		}
-		if named, ok := aliases.Unalias(obj.Type()).(*types.Named); ok {
+		if named, ok := types.Unalias(obj.Type()).(*types.Named); ok {
 			origin = named.Obj()
 		}
 	}

@@ -57,35 +57,34 @@ var usedGoplsStar = make(map[prop]bool)
 
 // For gopls compatibility, use a different, typically more restrictive, type for some fields.
 var renameProp = map[prop]string{
-	{"CancelParams", "id"}:         "interface{}",
-	{"Command", "arguments"}:       "[]json.RawMessage",
-	{"CompletionItem", "textEdit"}: "TextEdit",
-	{"CodeAction", "data"}:         "json.RawMessage", // delay unmarshalling commands
-	{"Diagnostic", "code"}:         "interface{}",
-	{"Diagnostic", "data"}:         "json.RawMessage", // delay unmarshalling quickfixes
+	{"CancelParams", "id"}:   "any",
+	{"Command", "arguments"}: "[]json.RawMessage",
+	{"CodeAction", "data"}:   "json.RawMessage", // delay unmarshalling commands
+	{"Diagnostic", "code"}:   "any",
+	{"Diagnostic", "data"}:   "json.RawMessage", // delay unmarshalling quickfixes
 
-	{"DocumentDiagnosticReportPartialResult", "relatedDocuments"}: "map[DocumentURI]interface{}",
+	{"DocumentDiagnosticReportPartialResult", "relatedDocuments"}: "map[DocumentURI]any",
 
 	{"ExecuteCommandParams", "arguments"}: "[]json.RawMessage",
 	{"FoldingRange", "kind"}:              "string",
 	{"Hover", "contents"}:                 "MarkupContent",
 	{"InlayHint", "label"}:                "[]InlayHintLabelPart",
 
-	{"RelatedFullDocumentDiagnosticReport", "relatedDocuments"}:      "map[DocumentURI]interface{}",
-	{"RelatedUnchangedDocumentDiagnosticReport", "relatedDocuments"}: "map[DocumentURI]interface{}",
+	{"RelatedFullDocumentDiagnosticReport", "relatedDocuments"}:      "map[DocumentURI]any",
+	{"RelatedUnchangedDocumentDiagnosticReport", "relatedDocuments"}: "map[DocumentURI]any",
 
 	// PJW: this one is tricky.
-	{"ServerCapabilities", "codeActionProvider"}: "interface{}",
+	{"ServerCapabilities", "codeActionProvider"}: "any",
 
-	{"ServerCapabilities", "inlayHintProvider"}: "interface{}",
+	{"ServerCapabilities", "inlayHintProvider"}: "any",
 	// slightly tricky
-	{"ServerCapabilities", "renameProvider"}: "interface{}",
+	{"ServerCapabilities", "renameProvider"}: "any",
 	// slightly tricky
-	{"ServerCapabilities", "semanticTokensProvider"}: "interface{}",
+	{"ServerCapabilities", "semanticTokensProvider"}: "any",
 	// slightly tricky
-	{"ServerCapabilities", "textDocumentSync"}: "interface{}",
+	{"ServerCapabilities", "textDocumentSync"}: "any",
 	{"TextDocumentSyncOptions", "save"}:        "SaveOptions",
-	{"WorkspaceEdit", "documentChanges"}:       "[]DocumentChanges",
+	{"WorkspaceEdit", "documentChanges"}:       "[]DocumentChange",
 }
 
 // which entries of renameProp were used
@@ -121,11 +120,9 @@ var usedDisambiguate = make(map[string]bool)
 var goplsType = map[string]string{
 	"And_RegOpt_textDocument_colorPresentation": "WorkDoneProgressOptionsAndTextDocumentRegistrationOptions",
 	"ConfigurationParams":                       "ParamConfiguration",
-	"DocumentDiagnosticParams":                  "string",
-	"DocumentDiagnosticReport":                  "string",
 	"DocumentUri":                               "DocumentURI",
 	"InitializeParams":                          "ParamInitialize",
-	"LSPAny":                                    "interface{}",
+	"LSPAny":                                    "any",
 
 	"Lit_SemanticTokensOptions_range_Item1": "PRangeESemanticTokensOptions",
 
@@ -133,18 +130,18 @@ var goplsType = map[string]string{
 	"Or_DidChangeConfigurationRegistrationOptions_section": "OrPSection_workspace_didChangeConfiguration",
 	"Or_InlayHintLabelPart_tooltip":                        "OrPTooltipPLabel",
 	"Or_InlayHint_tooltip":                                 "OrPTooltip_textDocument_inlayHint",
-	"Or_LSPAny":                                            "interface{}",
+	"Or_LSPAny":                                            "any",
 
 	"Or_ParameterInformation_documentation":            "string",
 	"Or_ParameterInformation_label":                    "string",
 	"Or_PrepareRenameResult":                           "PrepareRenamePlaceholder",
-	"Or_ProgressToken":                                 "interface{}",
+	"Or_ProgressToken":                                 "any",
 	"Or_Result_textDocument_completion":                "CompletionList",
 	"Or_Result_textDocument_declaration":               "Or_textDocument_declaration",
 	"Or_Result_textDocument_definition":                "[]Location",
-	"Or_Result_textDocument_documentSymbol":            "[]interface{}",
+	"Or_Result_textDocument_documentSymbol":            "[]any",
 	"Or_Result_textDocument_implementation":            "[]Location",
-	"Or_Result_textDocument_semanticTokens_full_delta": "interface{}",
+	"Or_Result_textDocument_semanticTokens_full_delta": "any",
 	"Or_Result_textDocument_typeDefinition":            "[]Location",
 	"Or_Result_workspace_symbol":                       "[]SymbolInformation",
 	"Or_TextDocumentContentChangeEvent":                "TextDocumentContentChangePartial",
@@ -155,7 +152,7 @@ var goplsType = map[string]string{
 
 	"Tuple_ParameterInformation_label_Item1": "UIntCommaUInt",
 	"WorkspaceFoldersServerCapabilities":     "WorkspaceFolders5Gn",
-	"[]LSPAny":                               "[]interface{}",
+	"[]LSPAny":                               "[]any",
 
 	"[]Or_Result_textDocument_codeAction_Item0_Elem": "[]CodeAction",
 	"[]PreviousResultId":                             "[]PreviousResultID",
@@ -259,6 +256,8 @@ var methodNames = map[string]string{
 	"workspace/inlineValue/refresh":          "InlineValueRefresh",
 	"workspace/semanticTokens/refresh":       "SemanticTokensRefresh",
 	"workspace/symbol":                       "Symbol",
+	"workspace/textDocumentContent":          "TextDocumentContent",
+	"workspace/textDocumentContent/refresh":  "TextDocumentContentRefresh",
 	"workspace/willCreateFiles":              "WillCreateFiles",
 	"workspace/willDeleteFiles":              "WillDeleteFiles",
 	"workspace/willRenameFiles":              "WillRenameFiles",

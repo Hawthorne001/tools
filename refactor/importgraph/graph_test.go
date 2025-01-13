@@ -17,7 +17,7 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/go/packages/packagestest"
+	"golang.org/x/tools/internal/packagestest"
 	"golang.org/x/tools/refactor/importgraph"
 
 	_ "crypto/hmac" // just for test, below
@@ -153,7 +153,7 @@ func TestBuild(t *testing.T) {
 	}
 	if !reverse.Search(this)[this] {
 		printNode("reverse", this)
-		t.Errorf("irrefexive: reverse.Search(importgraph)[importgraph] not found")
+		t.Errorf("irreflexive: reverse.Search(importgraph)[importgraph] not found")
 	}
 
 	// Test Search is transitive.  (There is no direct edge to these packages.)

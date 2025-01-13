@@ -5,8 +5,6 @@
 package fillreturns_test
 
 import (
-	"os"
-	"strings"
 	"testing"
 
 	"golang.org/x/tools/go/analysis/analysistest"
@@ -14,11 +12,6 @@ import (
 )
 
 func Test(t *testing.T) {
-	// TODO(golang/go#65294): delete once gotypesalias=1 is the default.
-	if strings.Contains(os.Getenv("GODEBUG"), "gotypesalias=1") {
-		t.Skip("skipping due to gotypesalias=1, which changes (improves) the result; reenable and update the expectations once it is the default")
-	}
-
 	testdata := analysistest.TestData()
 	analysistest.RunWithSuggestedFixes(t, testdata, fillreturns.Analyzer, "a", "typeparams")
 }

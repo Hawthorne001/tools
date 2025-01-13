@@ -85,7 +85,8 @@ func TestZeroConfigAlgorithm(t *testing.T) {
 				options: func(dir string) map[string]any {
 					return map[string]any{
 						"env": map[string]any{
-							"GOPATH": dir,
+							"GO111MODULE": "", // golang/go#70196: must be unset
+							"GOPATH":      dir,
 						},
 					}
 				},
@@ -336,22 +337,21 @@ replace (
 			for _, f := range test.folders {
 				opts := settings.DefaultOptions()
 				if f.options != nil {
-					results := settings.SetOptions(opts, f.options(dir))
-					for _, r := range results {
-						if r.Error != nil {
-							t.Fatalf("setting option %v: %v", r.Name, r.Error)
-						}
+					for _, err := range opts.Set(f.options(dir)) {
+						t.Fatal(err)
 					}
 				}
-				env, err := FetchGoEnv(ctx, toURI(f.dir), opts)
+				uri := toURI(f.dir)
+				env, err := FetchGoEnv(ctx, uri, opts)
 				if err != nil {
 					t.Fatalf("FetchGoEnv failed: %v", err)
 				}
+				t.Logf("FetchGoEnv(%q) = %+v", uri, env)
 				folders = append(folders, &Folder{
-					Dir:     toURI(f.dir),
+					Dir:     uri,
 					Name:    path.Base(f.dir),
 					Options: opts,
-					Env:     env,
+					Env:     *env,
 				})
 			}
 

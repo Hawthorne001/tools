@@ -2,20 +2,34 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package settings
+package settings_test
 
 import (
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
+	"golang.org/x/tools/gopls/internal/clonetest"
+	. "golang.org/x/tools/gopls/internal/settings"
 )
 
-func TestSetOption(t *testing.T) {
-	tests := []struct {
+func TestDefaultsEquivalence(t *testing.T) {
+	opts1 := DefaultOptions()
+	opts2 := DefaultOptions()
+	if !reflect.DeepEqual(opts1, opts2) {
+		t.Fatal("default options are not equivalent using reflect.DeepEqual")
+	}
+}
+
+func TestOptions_Set(t *testing.T) {
+	type testCase struct {
 		name      string
-		value     interface{}
+		value     any
 		wantError bool
 		check     func(Options) bool
-	}{
+	}
+	tests := []testCase{
 		{
 			name:  "symbolStyle",
 			value: "Dynamic",
@@ -44,14 +58,8 @@ func TestSetOption(t *testing.T) {
 			check: func(o Options) bool { return o.CompletionBudget == 2*time.Second },
 		},
 		{
-			name:      "staticcheck",
-			value:     true,
-			check:     func(o Options) bool { return o.Staticcheck == true },
-			wantError: true, // o.StaticcheckSupported is unset
-		},
-		{
 			name:  "codelenses",
-			value: map[string]interface{}{"generate": true},
+			value: map[string]any{"generate": true},
 			check: func(o Options) bool { return o.Codelenses["generate"] },
 		},
 		{
@@ -83,17 +91,33 @@ func TestSetOption(t *testing.T) {
 			},
 		},
 		{
-			name:  "hoverKind",
-			value: "Structured",
+			name:      "hoverKind",
+			value:     "Structured",
+			wantError: true,
 			check: func(o Options) bool {
-				return o.HoverKind == Structured
+				return o.HoverKind == FullDocumentation
+			},
+		},
+		{
+			name:      "ui.documentation.hoverKind",
+			value:     "Structured",
+			wantError: true,
+			check: func(o Options) bool {
+				return o.HoverKind == FullDocumentation
+			},
+		},
+		{
+			name:  "hoverKind",
+			value: "FullDocumentation",
+			check: func(o Options) bool {
+				return o.HoverKind == FullDocumentation
 			},
 		},
 		{
 			name:  "ui.documentation.hoverKind",
-			value: "Structured",
+			value: "FullDocumentation",
 			check: func(o Options) bool {
-				return o.HoverKind == Structured
+				return o.HoverKind == FullDocumentation
 			},
 		},
 		{
@@ -119,7 +143,7 @@ func TestSetOption(t *testing.T) {
 		},
 		{
 			name:  "env",
-			value: map[string]interface{}{"testing": "true"},
+			value: map[string]any{"testing": "true"},
 			check: func(o Options) bool {
 				v, found := o.Env["testing"]
 				return found && v == "true"
@@ -135,14 +159,14 @@ func TestSetOption(t *testing.T) {
 		},
 		{
 			name:  "directoryFilters",
-			value: []interface{}{"-node_modules", "+project_a"},
+			value: []any{"-node_modules", "+project_a"},
 			check: func(o Options) bool {
 				return len(o.DirectoryFilters) == 2
 			},
 		},
 		{
 			name:      "directoryFilters",
-			value:     []interface{}{"invalid"},
+			value:     []any{"invalid"},
 			wantError: true,
 			check: func(o Options) bool {
 				return len(o.DirectoryFilters) == 0
@@ -157,19 +181,8 @@ func TestSetOption(t *testing.T) {
 			},
 		},
 		{
-			name: "annotations",
-			value: map[string]interface{}{
-				"Nil":      false,
-				"noBounds": true,
-			},
-			wantError: true,
-			check: func(o Options) bool {
-				return !o.Annotations[Nil] && !o.Annotations[Bounds]
-			},
-		},
-		{
 			name:      "vulncheck",
-			value:     []interface{}{"invalid"},
+			value:     []any{"invalid"},
 			wantError: true,
 			check: func(o Options) bool {
 				return o.Vulncheck == "" // For invalid value, default to 'off'.
@@ -193,14 +206,42 @@ func TestSetOption(t *testing.T) {
 
 	for _, test := range tests {
 		var opts Options
-		result := opts.set(test.name, test.value, map[string]struct{}{})
-		if (result.Error != nil) != test.wantError {
-			t.Fatalf("Options.set(%q, %v): result.Error = %v, want error: %t", test.name, test.value, result.Error, test.wantError)
+		err := opts.Set(map[string]any{test.name: test.value})
+		if err != nil {
+			if !test.wantError {
+				t.Errorf("Options.set(%q, %v) failed: %v",
+					test.name, test.value, err)
+			}
+			continue
+		} else if test.wantError {
+			t.Fatalf("Options.set(%q, %v) succeeded unexpectedly",
+				test.name, test.value)
 		}
+
 		// TODO: this could be made much better using cmp.Diff, if that becomes
 		// available in this module.
 		if !test.check(opts) {
 			t.Errorf("Options.set(%q, %v): unexpected result %+v", test.name, test.value, opts)
 		}
+	}
+}
+
+func TestOptions_Clone(t *testing.T) {
+	// Test that the Options.Clone actually performs a deep clone of the Options
+	// struct.
+
+	golden := clonetest.NonZero[*Options]()
+	opts := clonetest.NonZero[*Options]()
+	opts2 := opts.Clone()
+
+	// The clone should be equivalent to the original.
+	if diff := cmp.Diff(golden, opts2); diff != "" {
+		t.Errorf("Clone() does not match original (-want +got):\n%s", diff)
+	}
+
+	// Mutating the clone should not mutate the original.
+	clonetest.ZeroOut(opts2)
+	if diff := cmp.Diff(golden, opts); diff != "" {
+		t.Errorf("Mutating clone mutated the original (-want +got):\n%s", diff)
 	}
 }

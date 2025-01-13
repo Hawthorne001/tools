@@ -21,11 +21,13 @@ import (
 	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/tokeninternal"
+	gofumptFormat "mvdan.cc/gofumpt/format"
 )
 
 // Format formats a file with a given range.
@@ -66,7 +68,7 @@ func Format(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]pr
 
 	// Apply additional formatting, if any is supported. Currently, the only
 	// supported additional formatter is gofumpt.
-	if format := snapshot.Options().GofumptFormat; snapshot.Options().Gofumpt && format != nil {
+	if snapshot.Options().Gofumpt {
 		// gofumpt can customize formatting based on language version and module
 		// path, if available.
 		//
@@ -75,15 +77,17 @@ func Format(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle) ([]pr
 		// TODO: under which circumstances can we fail to find module information?
 		// Can this, for example, result in inconsistent formatting across saves,
 		// due to pending calls to packages.Load?
-		var langVersion, modulePath string
+		var opts gofumptFormat.Options
 		meta, err := NarrowestMetadataForFile(ctx, snapshot, fh.URI())
 		if err == nil {
 			if mi := meta.Module; mi != nil {
-				langVersion = mi.GoVersion
-				modulePath = mi.Path
+				if v := mi.GoVersion; v != "" {
+					opts.LangVersion = "go" + v
+				}
+				opts.ModulePath = mi.Path
 			}
 		}
-		b, err := format(ctx, langVersion, modulePath, buf.Bytes())
+		b, err := gofumptFormat.Source(buf.Bytes(), opts)
 		if err != nil {
 			return nil, err
 		}
@@ -113,30 +117,41 @@ type importFix struct {
 // it returns a list of fixes that could be applied to the file, with the
 // corresponding TextEdits that would be needed to apply that fix.
 func allImportsFixes(ctx context.Context, snapshot *cache.Snapshot, pgf *parsego.File) (allFixEdits []protocol.TextEdit, editsPerFix []*importFix, err error) {
-	ctx, done := event.Start(ctx, "golang.AllImportsFixes")
+	ctx, done := event.Start(ctx, "golang.allImportsFixes")
 	defer done()
 
 	if err := snapshot.RunProcessEnvFunc(ctx, func(ctx context.Context, opts *imports.Options) error {
-		allFixEdits, editsPerFix, err = computeImportEdits(ctx, pgf, opts)
+		allFixEdits, editsPerFix, err = computeImportEdits(ctx, pgf, snapshot, opts)
 		return err
 	}); err != nil {
-		return nil, nil, fmt.Errorf("AllImportsFixes: %v", err)
+		return nil, nil, fmt.Errorf("allImportsFixes: %v", err)
 	}
 	return allFixEdits, editsPerFix, nil
 }
 
 // computeImportEdits computes a set of edits that perform one or all of the
 // necessary import fixes.
-func computeImportEdits(ctx context.Context, pgf *parsego.File, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*importFix, err error) {
+func computeImportEdits(ctx context.Context, pgf *parsego.File, snapshot *cache.Snapshot, options *imports.Options) (allFixEdits []protocol.TextEdit, editsPerFix []*importFix, err error) {
+	goroot := snapshot.View().Folder().Env.GOROOT
 	filename := pgf.URI.Path()
 
 	// Build up basic information about the original file.
-	allFixes, err := imports.FixImports(ctx, filename, pgf.Src, options)
+	isource, err := imports.NewProcessEnvSource(options.Env, filename, pgf.File.Name.Name)
+	var source imports.Source
+	switch snapshot.Options().ImportsSource {
+	case settings.ImportsSourceGopls:
+		source = snapshot.NewGoplsSource(isource)
+	case settings.ImportsSourceOff: // for cider, which has no file system
+		source = nil
+	case settings.ImportsSourceGoimports:
+		source = isource
+	}
+	allFixes, err := imports.FixImports(ctx, filename, pgf.Src, goroot, options.Env.Logf, source)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	allFixEdits, err = computeFixEdits(pgf, options, allFixes)
+	allFixEdits, err = computeFixEdits(pgf.Src, options, allFixes)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -144,7 +159,7 @@ func computeImportEdits(ctx context.Context, pgf *parsego.File, options *imports
 	// Apply all of the import fixes to the file.
 	// Add the edits for each fix to the result.
 	for _, fix := range allFixes {
-		edits, err := computeFixEdits(pgf, options, []*imports.ImportFix{fix})
+		edits, err := computeFixEdits(pgf.Src, options, []*imports.ImportFix{fix})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -156,10 +171,10 @@ func computeImportEdits(ctx context.Context, pgf *parsego.File, options *imports
 	return allFixEdits, editsPerFix, nil
 }
 
-// ComputeOneImportFixEdits returns text edits for a single import fix.
-func ComputeOneImportFixEdits(snapshot *cache.Snapshot, pgf *parsego.File, fix *imports.ImportFix) ([]protocol.TextEdit, error) {
+// ComputeImportFixEdits returns text edits for a single import fix.
+func ComputeImportFixEdits(localPrefix string, src []byte, fixes ...*imports.ImportFix) ([]protocol.TextEdit, error) {
 	options := &imports.Options{
-		LocalPrefix: snapshot.Options().Local,
+		LocalPrefix: localPrefix,
 		// Defaults.
 		AllErrors:  true,
 		Comments:   true,
@@ -168,18 +183,18 @@ func ComputeOneImportFixEdits(snapshot *cache.Snapshot, pgf *parsego.File, fix *
 		TabIndent:  true,
 		TabWidth:   8,
 	}
-	return computeFixEdits(pgf, options, []*imports.ImportFix{fix})
+	return computeFixEdits(src, options, fixes)
 }
 
-func computeFixEdits(pgf *parsego.File, options *imports.Options, fixes []*imports.ImportFix) ([]protocol.TextEdit, error) {
+func computeFixEdits(src []byte, options *imports.Options, fixes []*imports.ImportFix) ([]protocol.TextEdit, error) {
 	// trim the original data to match fixedData
-	left, err := importPrefix(pgf.Src)
+	left, err := importPrefix(src)
 	if err != nil {
 		return nil, err
 	}
 	extra := !strings.Contains(left, "\n") // one line may have more than imports
 	if extra {
-		left = string(pgf.Src)
+		left = string(src)
 	}
 	if len(left) > 0 && left[len(left)-1] != '\n' {
 		left += "\n"
@@ -191,7 +206,7 @@ func computeFixEdits(pgf *parsego.File, options *imports.Options, fixes []*impor
 		// used all of origData above, use all of it here too
 		flags = 0
 	}
-	fixedData, err := imports.ApplyFixes(fixes, "", pgf.Src, options, flags)
+	fixedData, err := imports.ApplyFixes(fixes, "", src, options, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -212,7 +227,7 @@ func importPrefix(src []byte) (string, error) {
 	if err != nil { // This can happen if 'package' is misspelled
 		return "", fmt.Errorf("importPrefix: failed to parse: %s", err)
 	}
-	tok := fset.File(f.Pos())
+	tok := fset.File(f.FileStart)
 	var importEnd int
 	for _, d := range f.Decls {
 		if x, ok := d.(*ast.GenDecl); ok && x.Tok == token.IMPORT {

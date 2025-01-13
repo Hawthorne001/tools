@@ -8,7 +8,7 @@ package printf
 
 import "fmt"
 
-func myPrintf(string, ...interface{}) {}
+func myPrintf(string, ...any) {}
 
 func _() {
 	var (
@@ -36,4 +36,7 @@ func _() {
 		a, //@rank(",", printfInt, printfFloat)
 		a, //@rank(",", printfFloat, printfInt)
 	)
+
+  // Don't insert as "&aStringer"
+	fmt.Printf("%p", a) //@snippet(")", printfStringer, "aStringer")
 }

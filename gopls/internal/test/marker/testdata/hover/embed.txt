@@ -34,12 +34,16 @@ func (P) m() {}
 
 var p P //@hover("P", "P", P)
 
+var _ = P.m
+
 -- @P --
 ```go
 type P struct {
 	q.Q
 }
 ```
+
+---
 
 doc
 
@@ -53,5 +57,7 @@ Three *chan int // through Q.q2
 ```go
 func (P) m()
 ```
+
+---
 
 [`p.P` on pkg.go.dev](https://pkg.go.dev/example.com#P)

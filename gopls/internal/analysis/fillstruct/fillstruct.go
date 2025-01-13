@@ -24,41 +24,43 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/gopls/internal/fuzzy"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/analysisinternal"
-	"golang.org/x/tools/internal/fuzzy"
 	"golang.org/x/tools/internal/typeparams"
+	"golang.org/x/tools/internal/typesinternal"
 )
 
 // Diagnose computes diagnostics for fillable struct literals overlapping with
-// the provided start and end position.
+// the provided start and end position of file f.
 //
 // The diagnostic contains a lazy fix; the actual patch is computed
 // (via the ApplyFix command) by a call to [SuggestedFix].
 //
-// If either start or end is invalid, the entire package is inspected.
-func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Package, info *types.Info) []analysis.Diagnostic {
+// If either start or end is invalid, the entire file is inspected.
+func Diagnose(f *ast.File, start, end token.Pos, pkg *types.Package, info *types.Info) []analysis.Diagnostic {
 	var diags []analysis.Diagnostic
-	nodeFilter := []ast.Node{(*ast.CompositeLit)(nil)}
-	inspect.Preorder(nodeFilter, func(n ast.Node) {
-		expr := n.(*ast.CompositeLit)
-
-		if (start.IsValid() && expr.End() < start) || (end.IsValid() && expr.Pos() > end) {
-			return // non-overlapping
+	ast.Inspect(f, func(n ast.Node) bool {
+		if n == nil {
+			return true // pop
 		}
-
+		if start.IsValid() && n.End() < start || end.IsValid() && n.Pos() > end {
+			return false // skip non-overlapping subtree
+		}
+		expr, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
 		typ := info.TypeOf(expr)
 		if typ == nil {
-			return
+			return true
 		}
 
 		// Find reference to the type declaration of the struct being initialized.
 		typ = typeparams.Deref(typ)
 		tStruct, ok := typeparams.CoreType(typ).(*types.Struct)
 		if !ok {
-			return
+			return true
 		}
 		// Inv: typ is the possibly-named struct type.
 
@@ -66,7 +68,7 @@ func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Pac
 
 		// Skip any struct that is already populated or that has no fields.
 		if fieldCount == 0 || fieldCount == len(expr.Elts) {
-			return
+			return true
 		}
 
 		// Are any fields in need of filling?
@@ -80,14 +82,14 @@ func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Pac
 			fillableFields = append(fillableFields, fmt.Sprintf("%s: %s", field.Name(), field.Type().String()))
 		}
 		if len(fillableFields) == 0 {
-			return
+			return true
 		}
 
 		// Derive a name for the struct type.
 		var name string
 		if typ != tStruct {
 			// named struct type (e.g. pkg.S[T])
-			name = types.TypeString(typ, types.RelativeTo(pkg))
+			name = types.TypeString(typ, typesinternal.NameRelativeTo(pkg))
 		} else {
 			// anonymous struct type
 			totalFields := len(fillableFields)
@@ -116,6 +118,7 @@ func Diagnose(inspect *inspector.Inspector, start, end token.Pos, pkg *types.Pac
 				// No TextEdits => computed later by gopls.
 			}},
 		})
+		return true
 	})
 
 	return diags
@@ -156,7 +159,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 	tStruct, ok := typ.Underlying().(*types.Struct)
 	if !ok {
 		return nil, nil, fmt.Errorf("%s is not a (pointer to) struct type",
-			types.TypeString(typ, types.RelativeTo(pkg)))
+			types.TypeString(typ, typesinternal.NameRelativeTo(pkg)))
 	}
 	// Inv: typ is the possibly-named struct type.
 
@@ -196,6 +199,7 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 		fieldTyps = append(fieldTyps, field.Type())
 	}
 	matches := analysisinternal.MatchingIdents(fieldTyps, file, start, info, pkg)
+	qual := typesinternal.FileQualifier(file, pkg)
 	var elts []ast.Expr
 	for i, fieldTyp := range fieldTyps {
 		if fieldTyp == nil {
@@ -229,8 +233,8 @@ func SuggestedFix(fset *token.FileSet, start, end token.Pos, content []byte, fil
 			// NOTE: We currently match on the name of the field key rather than the field type.
 			if best := fuzzy.BestMatch(fieldName, names); best != "" {
 				kv.Value = ast.NewIdent(best)
-			} else if v := populateValue(file, pkg, fieldTyp); v != nil {
-				kv.Value = v
+			} else if expr, isValid := populateValue(fieldTyp, qual); isValid {
+				kv.Value = expr
 			} else {
 				return nil, nil, nil // no fix to suggest
 			}
@@ -326,69 +330,43 @@ func indent(str, ind []byte) []byte {
 // The reasoning here is that users will call fillstruct with the intention of
 // initializing the struct, in which case setting these fields to nil has no effect.
 //
-// populateValue returns nil if the value cannot be filled.
-func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
-	switch u := typ.Underlying().(type) {
-	case *types.Basic:
-		switch {
-		case u.Info()&types.IsNumeric != 0:
-			return &ast.BasicLit{Kind: token.INT, Value: "0"}
-		case u.Info()&types.IsBoolean != 0:
-			return &ast.Ident{Name: "false"}
-		case u.Info()&types.IsString != 0:
-			return &ast.BasicLit{Kind: token.STRING, Value: `""`}
-		case u.Kind() == types.UnsafePointer:
-			return ast.NewIdent("nil")
-		case u.Kind() == types.Invalid:
-			return nil
+// If the input contains an invalid type, populateValue may panic or return
+// expression that may not compile.
+func populateValue(typ types.Type, qual types.Qualifier) (_ ast.Expr, isValid bool) {
+	switch t := typ.(type) {
+	case *types.TypeParam, *types.Interface, *types.Struct, *types.Basic:
+		return typesinternal.ZeroExpr(t, qual)
+
+	case *types.Alias, *types.Named:
+		switch t.Underlying().(type) {
+		// Avoid typesinternal.ZeroExpr here as we don't want to return nil.
+		case *types.Map, *types.Slice:
+			return &ast.CompositeLit{
+				Type: typesinternal.TypeExpr(t, qual),
+			}, true
 		default:
-			panic(fmt.Sprintf("unknown basic type %v", u))
+			return typesinternal.ZeroExpr(t, qual)
 		}
 
-	case *types.Map:
-		k := analysisinternal.TypeExpr(f, pkg, u.Key())
-		v := analysisinternal.TypeExpr(f, pkg, u.Elem())
-		if k == nil || v == nil {
-			return nil
-		}
+	// Avoid typesinternal.ZeroExpr here as we don't want to return nil.
+	case *types.Map, *types.Slice:
 		return &ast.CompositeLit{
-			Type: &ast.MapType{
-				Key:   k,
-				Value: v,
-			},
-		}
-	case *types.Slice:
-		s := analysisinternal.TypeExpr(f, pkg, u.Elem())
-		if s == nil {
-			return nil
-		}
-		return &ast.CompositeLit{
-			Type: &ast.ArrayType{
-				Elt: s,
-			},
-		}
+			Type: typesinternal.TypeExpr(t, qual),
+		}, true
 
 	case *types.Array:
-		a := analysisinternal.TypeExpr(f, pkg, u.Elem())
-		if a == nil {
-			return nil
-		}
 		return &ast.CompositeLit{
 			Type: &ast.ArrayType{
-				Elt: a,
+				Elt: typesinternal.TypeExpr(t.Elem(), qual),
 				Len: &ast.BasicLit{
-					Kind: token.INT, Value: fmt.Sprintf("%v", u.Len()),
+					Kind: token.INT, Value: fmt.Sprintf("%v", t.Len()),
 				},
 			},
-		}
+		}, true
 
 	case *types.Chan:
-		v := analysisinternal.TypeExpr(f, pkg, u.Elem())
-		if v == nil {
-			return nil
-		}
-		dir := ast.ChanDir(u.Dir())
-		if u.Dir() == types.SendRecv {
+		dir := ast.ChanDir(t.Dir())
+		if t.Dir() == types.SendRecv {
 			dir = ast.SEND | ast.RECV
 		}
 		return &ast.CallExpr{
@@ -396,60 +374,35 @@ func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 			Args: []ast.Expr{
 				&ast.ChanType{
 					Dir:   dir,
-					Value: v,
+					Value: typesinternal.TypeExpr(t.Elem(), qual),
 				},
 			},
-		}
-
-	case *types.Struct:
-		s := analysisinternal.TypeExpr(f, pkg, typ)
-		if s == nil {
-			return nil
-		}
-		return &ast.CompositeLit{
-			Type: s,
-		}
+		}, true
 
 	case *types.Signature:
-		var params []*ast.Field
-		for i := 0; i < u.Params().Len(); i++ {
-			p := analysisinternal.TypeExpr(f, pkg, u.Params().At(i).Type())
-			if p == nil {
-				return nil
-			}
-			params = append(params, &ast.Field{
-				Type: p,
-				Names: []*ast.Ident{
-					{
-						Name: u.Params().At(i).Name(),
+		return &ast.FuncLit{
+			Type: typesinternal.TypeExpr(t, qual).(*ast.FuncType),
+			// The body of the function literal contains a panic statement to
+			// avoid type errors.
+			Body: &ast.BlockStmt{
+				List: []ast.Stmt{
+					&ast.ExprStmt{
+						X: &ast.CallExpr{
+							Fun: ast.NewIdent("panic"),
+							Args: []ast.Expr{
+								&ast.BasicLit{
+									Kind:  token.STRING,
+									Value: `"TODO"`,
+								},
+							},
+						},
 					},
 				},
-			})
-		}
-		var returns []*ast.Field
-		for i := 0; i < u.Results().Len(); i++ {
-			r := analysisinternal.TypeExpr(f, pkg, u.Results().At(i).Type())
-			if r == nil {
-				return nil
-			}
-			returns = append(returns, &ast.Field{
-				Type: r,
-			})
-		}
-		return &ast.FuncLit{
-			Type: &ast.FuncType{
-				Params: &ast.FieldList{
-					List: params,
-				},
-				Results: &ast.FieldList{
-					List: returns,
-				},
 			},
-			Body: &ast.BlockStmt{},
-		}
+		}, true
 
 	case *types.Pointer:
-		switch aliases.Unalias(u.Elem()).(type) {
+		switch tt := types.Unalias(t.Elem()).(type) {
 		case *types.Basic:
 			return &ast.CallExpr{
 				Fun: &ast.Ident{
@@ -457,38 +410,31 @@ func populateValue(f *ast.File, pkg *types.Package, typ types.Type) ast.Expr {
 				},
 				Args: []ast.Expr{
 					&ast.Ident{
-						Name: u.Elem().String(),
+						Name: t.Elem().String(),
 					},
 				},
-			}
+			}, true
+		// Pointer to type parameter should return new(T) instead of &*new(T).
+		case *types.TypeParam:
+			return &ast.CallExpr{
+				Fun: &ast.Ident{
+					Name: "new",
+				},
+				Args: []ast.Expr{
+					&ast.Ident{
+						Name: tt.Obj().Name(),
+					},
+				},
+			}, true
 		default:
-			x := populateValue(f, pkg, u.Elem())
-			if x == nil {
-				return nil
-			}
+			// TODO(hxjiang): & prefix only works if populateValue returns a
+			// composite literal T{} or the expression new(T).
+			expr, isValid := populateValue(t.Elem(), qual)
 			return &ast.UnaryExpr{
 				Op: token.AND,
-				X:  x,
-			}
+				X:  expr,
+			}, isValid
 		}
-
-	case *types.Interface:
-		if param, ok := aliases.Unalias(typ).(*types.TypeParam); ok {
-			// *new(T) is the zero value of a type parameter T.
-			// TODO(adonovan): one could give a more specific zero
-			// value if the type has a core type that is, say,
-			// always a number or a pointer. See go/ssa for details.
-			return &ast.StarExpr{
-				X: &ast.CallExpr{
-					Fun: ast.NewIdent("new"),
-					Args: []ast.Expr{
-						ast.NewIdent(param.Obj().Name()),
-					},
-				},
-			}
-		}
-
-		return ast.NewIdent("nil")
 	}
-	return nil
+	return nil, false
 }

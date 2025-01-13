@@ -16,6 +16,8 @@ package command
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/vulncheck"
@@ -24,22 +26,21 @@ import (
 // Interface defines the interface gopls exposes for the
 // workspace/executeCommand request.
 //
-// This interface is used to generate marshaling/unmarshaling code, dispatch,
-// and documentation, and so has some additional restrictions:
+// This interface is used to generate logic for marshaling,
+// unmarshaling, and dispatch, so it has some additional restrictions:
+//
 //  1. All method arguments must be JSON serializable.
+//
 //  2. Methods must return either error or (T, error), where T is a
 //     JSON serializable type.
-//  3. The first line of the doc string is special. Everything after the colon
-//     is considered the command 'Title'.
-//     TODO(rFindley): reconsider this -- Title may be unnecessary.
 //
-// The doc comment on each method is eventually published at
-// https://github.com/golang/tools/blob/master/gopls/doc/commands.md,
-// so please be consistent in using this form:
+//  3. The first line of the doc string is special.
+//     Everything after the colon is considered the command 'Title'.
+//     For example:
 //
-//	Command: Capitalized verb phrase with no period
+//     Command: Capitalized verb phrase with no period
 //
-//	Longer description here...
+//     Longer description here...
 type Interface interface {
 	// ApplyFix: Apply a fix
 	//
@@ -49,13 +50,20 @@ type Interface interface {
 	// Test: Run test(s) (legacy)
 	//
 	// Runs `go test` for a specific set of test or benchmark functions.
+	//
+	// This command is asynchronous; wait for the 'end' progress notification.
+	//
+	// This command is an alias for RunTests; the only difference
+	// is the form of the parameters.
+	//
+	// TODO(adonovan): eliminate it.
 	Test(context.Context, protocol.DocumentURI, []string, []string) error
-
-	// TODO: deprecate Test in favor of RunTests below.
 
 	// Test: Run test(s)
 	//
 	// Runs `go test` for a specific set of test or benchmark functions.
+	//
+	// This command is asynchronous; clients must wait for the 'end' progress notification.
 	RunTests(context.Context, RunTestsArgs) error
 
 	// Generate: Run go generate
@@ -63,11 +71,11 @@ type Interface interface {
 	// Runs `go generate` for a given directory.
 	Generate(context.Context, GenerateArgs) error
 
-	// Doc: View package documentation.
+	// Doc: Browse package documentation.
 	//
 	// Opens the Go package documentation page for the current
 	// package in a browser.
-	Doc(context.Context, protocol.Location) error
+	Doc(context.Context, DocArgs) (protocol.URI, error)
 
 	// RegenerateCgo: Regenerate cgo
 	//
@@ -124,17 +132,15 @@ type Interface interface {
 	// Runs `go get` to fetch a package.
 	GoGetPackage(context.Context, GoGetPackageArgs) error
 
-	// GCDetails: Toggle gc_details
+	// GCDetails: Toggle display of compiler optimization details
 	//
-	// Toggle the calculation of gc annotations.
+	// Toggle the per-package flag that causes Go compiler
+	// optimization decisions to be reported as diagnostics.
+	//
+	// (The name is a legacy of a time when the Go compiler was
+	// known as "gc". Renaming the command would break custom
+	// client-side logic in VS Code.)
 	GCDetails(context.Context, protocol.DocumentURI) error
-
-	// TODO: deprecate GCDetails in favor of ToggleGCDetails below.
-
-	// ToggleGCDetails: Toggle gc_details
-	//
-	// Toggle the calculation of gc annotations.
-	ToggleGCDetails(context.Context, URIArg) error
 
 	// ListKnownPackages: List known packages
 	//
@@ -153,6 +159,11 @@ type Interface interface {
 	// call applyEdit on the client so that clients don't have to apply the edit
 	// themselves.
 	AddImport(context.Context, AddImportArgs) error
+
+	// ExtractToNewFile: Move selected declarations to a new file
+	//
+	// Used by the code action of the same name.
+	ExtractToNewFile(context.Context, protocol.Location) error
 
 	// StartDebugging: Start the gopls debug server
 	//
@@ -175,14 +186,30 @@ type Interface interface {
 	// runner.
 	StopProfile(context.Context, StopProfileArgs) (StopProfileResult, error)
 
-	// RunGovulncheck: Run vulncheck
+	// GoVulncheck: run vulncheck synchronously.
 	//
 	// Run vulnerability check (`govulncheck`).
+	//
+	// This command is synchronous, and returns the govulncheck result.
+	Vulncheck(context.Context, VulncheckArgs) (VulncheckResult, error)
+
+	// RunGovulncheck: Run vulncheck asynchronously.
+	//
+	// Run vulnerability check (`govulncheck`).
+	//
+	// This command is asynchronous; clients must wait for the 'end' progress
+	// notification and then retrieve results using gopls.fetch_vulncheck_result.
+	//
+	// Deprecated: clients should call gopls.vulncheck instead, which returns the
+	// actual vulncheck result.
 	RunGovulncheck(context.Context, VulncheckArgs) (RunVulncheckResult, error)
 
 	// FetchVulncheckResult: Get known vulncheck result
 	//
 	// Fetch the result of latest vulnerability check (`govulncheck`).
+	//
+	// Deprecated: clients should call gopls.vulncheck instead, which returns the
+	// actual vulncheck result.
 	FetchVulncheckResult(context.Context, URIArg) (map[protocol.DocumentURI]*vulncheck.Result, error)
 
 	// MemStats: Fetch memory statistics
@@ -211,6 +238,9 @@ type Interface interface {
 	// to avoid conflicts with other counters gopls collects.
 	AddTelemetryCounters(context.Context, AddTelemetryCountersArgs) error
 
+	// AddTest: add test for the selected function
+	AddTest(context.Context, protocol.Location) (*protocol.WorkspaceEdit, error)
+
 	// MaybePromptForTelemetry: Prompt user to enable telemetry
 	//
 	// Checks for the right conditions, and then prompts the user
@@ -233,6 +263,49 @@ type Interface interface {
 	//
 	// This command is intended for use by gopls tests only.
 	Views(context.Context) ([]View, error)
+
+	// FreeSymbols: Browse free symbols referenced by the selection in a browser.
+	//
+	// This command is a query over a selected range of Go source
+	// code. It reports the set of "free" symbols of the
+	// selection: the set of symbols that are referenced within
+	// the selection but are declared outside of it. This
+	// information is useful for understanding at a glance what a
+	// block of code depends on, perhaps as a precursor to
+	// extracting it into a separate function.
+	FreeSymbols(ctx context.Context, viewID string, loc protocol.Location) error
+
+	// Assembly: Browse assembly listing of current function in a browser.
+	//
+	// This command opens a web-based disassembly listing of the
+	// specified function symbol (plus any nested lambdas and defers).
+	// The machine architecture is determined by the view.
+	Assembly(_ context.Context, viewID, packageID, symbol string) error
+
+	// ClientOpenURL: Request that the client open a URL in a browser.
+	ClientOpenURL(_ context.Context, url string) error
+
+	// ScanImports: force a sychronous scan of the imports cache.
+	//
+	// This command is intended for use by gopls tests only.
+	ScanImports(context.Context) error
+
+	// Packages: Return information about packages
+	//
+	// This command returns an empty result if the specified files
+	// or directories are not associated with any Views on the
+	// server yet.
+	Packages(context.Context, PackagesArgs) (PackagesResult, error)
+
+	// Modules: Return information about modules within a directory
+	//
+	// This command returns an empty result if there is no module, or if module
+	// mode is disabled. Modules will not cause any new views to be loaded and
+	// will only return modules associated with views that have already been
+	// loaded, regardless of how it is called. Given current usage (by the
+	// language server client), there should never be a case where Modules is
+	// called on a path that has not already been loaded.
+	Modules(context.Context, ModulesArgs) (ModulesResult, error)
 }
 
 type RunTestsArgs struct {
@@ -254,6 +327,11 @@ type GenerateArgs struct {
 	Recursive bool
 }
 
+type DocArgs struct {
+	Location     protocol.Location
+	ShowDocument bool // in addition to returning the URL, send showDocument
+}
+
 // TODO(rFindley): document the rest of these once the docgen is fleshed out.
 
 type ApplyFixArgs struct {
@@ -267,10 +345,9 @@ type ApplyFixArgs struct {
 	// upon by the code action and golang.ApplyFix.
 	Fix string
 
-	// The file URI for the document to fix.
-	URI protocol.DocumentURI
-	// The document range to scan for fixes.
-	Range protocol.Range
+	// The portion of the document to fix.
+	Location protocol.Location
+
 	// Whether to resolve and return the edits.
 	ResolveEdits bool
 }
@@ -446,20 +523,11 @@ type RunVulncheckResult struct {
 	Token protocol.ProgressToken
 }
 
-// CallStack models a trace of function calls starting
-// with a client function or method and ending with a
-// call to a vulnerable symbol.
-type CallStack []StackEntry
-
-// StackEntry models an element of a call stack.
-type StackEntry struct {
-	// See golang.org/x/exp/vulncheck.StackEntry.
-
-	// User-friendly representation of function/method names.
-	// e.g. package.funcName, package.(recvType).methodName, ...
-	Name string
-	URI  protocol.DocumentURI
-	Pos  protocol.Position // Start position. (0-based. Column is always 0)
+// VulncheckResult holds the result of synchronously running the vulncheck
+// command.
+type VulncheckResult struct {
+	// Result holds the result of running vulncheck.
+	Result *vulncheck.Result
 }
 
 // MemStatsResult holds selected fields from runtime.MemStats.
@@ -514,10 +582,66 @@ type AddTelemetryCountersArgs struct {
 }
 
 // ChangeSignatureArgs specifies a "change signature" refactoring to perform.
+//
+// The new signature is expressed via the NewParams and NewResults fields. The
+// elements of these lists each describe a new field of the signature, by
+// either referencing a field in the old signature or by defining a new field:
+//   - If the element is an integer, it references a positional parameter in the
+//     old signature.
+//   - If the element is a string, it is parsed as a new field to add.
+//
+// Suppose we have a function `F(a, b int) (string, error)`. Here are some
+// examples of refactoring this signature in practice, eliding the 'Location'
+// and 'ResolveEdits' fields.
+//   - `{ "NewParams": [0], "NewResults": [0, 1] }` removes the second parameter
+//   - `{ "NewParams": [1, 0], "NewResults": [0, 1] }` flips the parameter order
+//   - `{ "NewParams": [0, 1, "a int"], "NewResults": [0, 1] }` adds a new field
+//   - `{ "NewParams": [1, 2], "NewResults": [1] }` drops the `error` result
 type ChangeSignatureArgs struct {
-	RemoveParameter protocol.Location
+	// Location is any range inside the function signature. By convention, this
+	// is the same location provided in the codeAction request.
+	Location protocol.Location // a range inside of the function signature, as passed to CodeAction
+
+	// NewParams describes parameters of the new signature.
+	// An int value references a parameter in the old signature by index.
+	// A string value describes a new parameter field (e.g. "x int").
+	NewParams []ChangeSignatureParam
+
+	// NewResults describes results of the new signature (see above).
+	// An int value references a result in the old signature by index.
+	// A string value describes a new result field (e.g. "err error").
+	NewResults []ChangeSignatureParam
+
 	// Whether to resolve and return the edits.
 	ResolveEdits bool
+}
+
+// ChangeSignatureParam implements the API described in the doc string of
+// [ChangeSignatureArgs]: a union of JSON int | string.
+type ChangeSignatureParam struct {
+	OldIndex int
+	NewField string
+}
+
+func (a *ChangeSignatureParam) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		a.NewField = s
+		return nil
+	}
+	var i int
+	if err := json.Unmarshal(b, &i); err == nil {
+		a.OldIndex = i
+		return nil
+	}
+	return fmt.Errorf("must be int or string")
+}
+
+func (a ChangeSignatureParam) MarshalJSON() ([]byte, error) {
+	if a.NewField != "" {
+		return json.Marshal(a.NewField)
+	}
+	return json.Marshal(a.OldIndex)
 }
 
 // DiagnoseFilesArgs specifies a set of files for which diagnostics are wanted.
@@ -527,8 +651,153 @@ type DiagnoseFilesArgs struct {
 
 // A View holds summary information about a cache.View.
 type View struct {
+	ID         string               // view ID (the index of this view among all views created)
 	Type       string               // view type (via cache.ViewType.String)
 	Root       protocol.DocumentURI // root dir of the view (e.g. containing go.mod or go.work)
 	Folder     protocol.DocumentURI // workspace folder associated with the view
 	EnvOverlay []string             // environment variable overrides
+}
+
+// PackagesArgs holds arguments for the Packages command.
+type PackagesArgs struct {
+	// Files is a list of files and directories whose associated
+	// packages should be described by the result.
+	//
+	// In some cases, a file may belong to more than one package;
+	// the result may describe any of them.
+	Files []protocol.DocumentURI
+
+	// Enumerate all packages under the directory loadable with
+	// the ... pattern.
+	// The search does not cross the module boundaries and
+	// does not return packages that are not yet loaded.
+	// (e.g. those excluded by the gopls directory filter setting,
+	// or the go.work configuration)
+	Recursive bool `json:"Recursive,omitempty"`
+
+	// Mode controls the types of information returned for each package.
+	Mode PackagesMode
+}
+
+// PackagesMode controls the details to include in PackagesResult.
+type PackagesMode uint64
+
+const (
+	// Populate the [TestFile.Tests] field in [Package] returned by the
+	// Packages command.
+	NeedTests PackagesMode = 1 << iota
+)
+
+// PackagesResult is the result of the Packages command.
+type PackagesResult struct {
+	// Packages is an unordered list of package metadata.
+	Packages []Package
+
+	// Module maps module path to module metadata for
+	// all the modules of the returned Packages.
+	Module map[string]Module
+}
+
+// Package describes a Go package (not an empty parent).
+type Package struct {
+	// Package path.
+	Path string
+	// Module path. Empty if the package doesn't
+	// belong to any module.
+	ModulePath string
+	// q in a "p [q.test]" package.
+	ForTest string
+
+	// Note: the result does not include the directory name
+	// of the package because mapping between a package and
+	// a folder is not possible in certain build systems.
+	// If directory info is needed, one can guess it
+	// from the TestFile's file name.
+
+	// TestFiles contains the subset of the files of the package
+	// whose name ends with "_test.go".
+	// They are ordered deterministically as determined
+	// by the underlying build system.
+	TestFiles []TestFile
+}
+
+type Module struct {
+	Path    string               // module path
+	Version string               // module version if any.
+	GoMod   protocol.DocumentURI // path to the go.mod file.
+}
+
+type TestFile struct {
+	URI protocol.DocumentURI // a *_test.go file
+
+	// Tests is the list of tests in File, including subtests.
+	//
+	// The set of subtests is not exhaustive as in general they may be
+	// dynamically generated, so it is impossible for static heuristics
+	// to enumerate them.
+	//
+	// Tests are lexically ordered.
+	// Since subtest names are prefixed by their top-level test names
+	// each top-level test precedes its subtests.
+	Tests []TestCase
+}
+
+// TestCase represents a test case.
+// A test case can be a top-level Test/Fuzz/Benchmark/Example function,
+// as recognized by 'go list' or 'go test -list', or
+// a subtest within a top-level function.
+type TestCase struct {
+	// Name is the complete name of the test (Test, Benchmark, Example, or Fuzz)
+	// or the subtest as it appears in the output of go test -json.
+	// The server may attempt to infer names of subtests by static
+	// analysis; if so, it should aim to simulate the actual computed
+	// name of the test, including any disambiguating suffix such as "#01".
+	// To run only this test, clients need to compute the -run, -bench, -fuzz
+	// flag values by first splitting the Name with "/" and
+	// quoting each element with "^" + regexp.QuoteMeta(Name) + "$".
+	// e.g. TestToplevel/Inner.Subtest → -run=^TestToplevel$/^Inner\.Subtest$
+	Name string
+
+	// Loc is the filename and range enclosing this test function
+	// or the subtest. This is used to place the gutter marker
+	// and group tests based on location.
+	// For subtests whose test names can be determined statically,
+	// this can be either t.Run or the test data table
+	// for table-driven setup.
+	// Some testing frameworks allow to declare the actual test
+	// logic in a different file. For example, one can define
+	// a testify test suite in suite_test.go and use it from
+	// main_test.go.
+	/*
+	   -- main_test.go --
+	   ...
+	   func TestFoo(t *testing.T) {
+	       suite.Run(t, new(MyTestSuite))
+	   }
+	   -- suite_test.go --
+	   type MyTestSuite struct {
+	   	suite.Suite
+	   }
+	   func (suite *MyTestSuite) TestBar() { ... }
+	*/
+	// In this case, the testing framework creates "TestFoo/TestBar"
+	// and the corresponding test case belongs to "main_test.go"
+	// TestFile. However, the test case has "suite_test.go" as its
+	// file location.
+	Loc protocol.Location
+}
+
+type ModulesArgs struct {
+	// Dir is the directory in which to search for go.mod files.
+	Dir protocol.DocumentURI
+
+	// MaxDepth is the directory walk limit.
+	// A value of 0 means inspect only Dir.
+	// 1 means inspect its child directories too, and so on.
+	// A negative value removes the limit.
+	MaxDepth int
+}
+
+type ModulesResult struct {
+	Modules []Module
 }

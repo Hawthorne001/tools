@@ -2,12 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package ssa
-
-// Note: Tests use unexported method _Instances.
+package ssa_test
 
 import (
-	"bytes"
 	"fmt"
 	"go/types"
 	"reflect"
@@ -15,42 +12,11 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/tools/go/loader"
+	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 )
 
-// loadProgram creates loader.Program out of p.
-func loadProgram(p string) (*loader.Program, error) {
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", p)
-	if err != nil {
-		return nil, fmt.Errorf("parse: %v", err)
-	}
-	conf.CreateFromFiles("p", f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		return nil, fmt.Errorf("Load: %v", err)
-	}
-	return lprog, nil
-}
-
-// buildPackage builds and returns ssa representation of package pkg of lprog.
-func buildPackage(lprog *loader.Program, pkg string, mode BuilderMode) *Package {
-	prog := NewProgram(lprog.Fset, mode)
-
-	for _, info := range lprog.AllPackages {
-		prog.CreatePackage(info.Pkg, info.Files, &info.Info, info.Importable)
-	}
-
-	p := prog.Package(lprog.Package(pkg).Pkg)
-	p.Build()
-	return p
-}
-
-// TestNeedsInstance ensures that new method instances can be created via needsInstance,
-// that TypeArgs are as expected, and can be accessed via _Instances.
+// TestNeedsInstance ensures that new method instances can be created via MethodValue.
 func TestNeedsInstance(t *testing.T) {
 	const input = `
 package p
@@ -74,14 +40,11 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 	//      func  init        func()
 	//      var   init$guard  bool
 
-	lprog, err := loadProgram(input)
-	if err != err {
-		t.Fatal(err)
-	}
-
-	for _, mode := range []BuilderMode{BuilderMode(0), InstantiateGenerics} {
-		// Create and build SSA
-		p := buildPackage(lprog, "p", mode)
+	for _, mode := range []ssa.BuilderMode{
+		ssa.SanityCheckFunctions,
+		ssa.SanityCheckFunctions | ssa.InstantiateGenerics,
+	} {
+		p, _ := buildPackage(t, input, mode)
 		prog := p.Prog
 
 		ptr := p.Type("Pointer").Type().(*types.Named)
@@ -96,49 +59,39 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 
 		meth := prog.FuncValue(obj)
 
-		var cr creator
-		intSliceTyp := types.NewSlice(types.Typ[types.Int])
-		instance := meth.instance([]types.Type{intSliceTyp}, &cr)
-		if len(cr) != 1 {
-			t.Errorf("Expected first instance to create a function. got %d created functions", len(cr))
+		// instantiateLoadMethod returns the first method (Load) of the instantiation *Pointer[T].
+		instantiateLoadMethod := func(T types.Type) *ssa.Function {
+			ptrT, err := types.Instantiate(nil, ptr, []types.Type{T}, false)
+			if err != nil {
+				t.Fatalf("Failed to Instantiate %q by %q", ptr, T)
+			}
+			methods := types.NewMethodSet(types.NewPointer(ptrT))
+			if methods.Len() != 1 {
+				t.Fatalf("Expected 1 method for %q. got %d", ptrT, methods.Len())
+			}
+			return prog.MethodValue(methods.At(0))
 		}
+
+		intSliceTyp := types.NewSlice(types.Typ[types.Int])
+		instance := instantiateLoadMethod(intSliceTyp) // (*Pointer[[]int]).Load
 		if instance.Origin() != meth {
 			t.Errorf("Expected Origin of %s to be %s. got %s", instance, meth, instance.Origin())
 		}
 		if len(instance.TypeArgs()) != 1 || !types.Identical(instance.TypeArgs()[0], intSliceTyp) {
-			t.Errorf("Expected TypeArgs of %s to be %v. got %v", instance, []types.Type{intSliceTyp}, instance.typeargs)
-		}
-		instances := allInstances(meth)
-		if want := []*Function{instance}; !reflect.DeepEqual(instances, want) {
-			t.Errorf("Expected instances of %s to be %v. got %v", meth, want, instances)
+			t.Errorf("Expected TypeArgs of %s to be %v. got %v", instance, []types.Type{intSliceTyp}, instance.TypeArgs())
 		}
 
 		// A second request with an identical type returns the same Function.
-		second := meth.instance([]types.Type{types.NewSlice(types.Typ[types.Int])}, &cr)
-		if second != instance || len(cr) != 1 {
-			t.Error("Expected second identical instantiation to not create a function")
+		second := instantiateLoadMethod(types.NewSlice(types.Typ[types.Int]))
+		if second != instance {
+			t.Error("Expected second identical instantiation to be the same function")
 		}
 
-		// Add a second instance.
-		inst2 := meth.instance([]types.Type{types.NewSlice(types.Typ[types.Uint])}, &cr)
-		instances = allInstances(meth)
+		// (*Pointer[[]uint]).Load
+		inst2 := instantiateLoadMethod(types.NewSlice(types.Typ[types.Uint]))
 
-		// Note: instance.Name() < inst2.Name()
-		sort.Slice(instances, func(i, j int) bool {
-			return instances[i].Name() < instances[j].Name()
-		})
-		if want := []*Function{instance, inst2}; !reflect.DeepEqual(instances, want) {
-			t.Errorf("Expected instances of %s to be %v. got %v", meth, want, instances)
-		}
-
-		// TODO(adonovan): tests should not rely on unexported functions.
-
-		// build and sanity check manually created instance.
-		var b builder
-		b.buildFunction(instance)
-		var buf bytes.Buffer
-		if !sanityCheck(instance, &buf) {
-			t.Errorf("sanityCheck of %s failed with: %s", instance, buf.String())
+		if instance.Name() >= inst2.Name() {
+			t.Errorf("Expected name of instance %s to be before instance %v", instance, inst2)
 		}
 	}
 }
@@ -194,13 +147,8 @@ func entry(i int, a A) int {
 	return Id[int](i)
 }
 `
-	lprog, err := loadProgram(input)
-	if err != err {
-		t.Fatal(err)
-	}
-
-	p := buildPackage(lprog, "p", SanityCheckFunctions)
-	prog := p.Prog
+	p, _ := buildPackage(t, input, ssa.SanityCheckFunctions)
+	all := ssautil.AllFunctions(p.Prog)
 
 	for _, ti := range []struct {
 		orig         string
@@ -216,12 +164,18 @@ func entry(i int, a A) int {
 	} {
 		test := ti
 		t.Run(test.instance, func(t *testing.T) {
-			f := p.Members[test.orig].(*Function)
+			f := p.Members[test.orig].(*ssa.Function)
 			if f == nil {
 				t.Fatalf("origin function not found")
 			}
 
-			i := instanceOf(f, test.instance, prog)
+			var i *ssa.Function
+			for _, fn := range instancesOf(all, f) {
+				if fn.Name() == test.instance {
+					i = fn
+					break
+				}
+			}
 			if i == nil {
 				t.Fatalf("instance not found")
 			}
@@ -250,16 +204,7 @@ func entry(i int, a A) int {
 	}
 }
 
-func instanceOf(f *Function, name string, prog *Program) *Function {
-	for _, i := range allInstances(f) {
-		if i.Name() == name {
-			return i
-		}
-	}
-	return nil
-}
-
-func tparams(f *Function) string {
+func tparams(f *ssa.Function) string {
 	tplist := f.TypeParams()
 	var tps []string
 	for i := 0; i < tplist.Len(); i++ {
@@ -268,7 +213,7 @@ func tparams(f *Function) string {
 	return fmt.Sprint(tps)
 }
 
-func targs(f *Function) string {
+func targs(f *ssa.Function) string {
 	var tas []string
 	for _, ta := range f.TypeArgs() {
 		tas = append(tas, ta.String())
@@ -276,10 +221,10 @@ func targs(f *Function) string {
 	return fmt.Sprint(tas)
 }
 
-func changeTypeInstrs(b *BasicBlock) int {
+func changeTypeInstrs(b *ssa.BasicBlock) int {
 	cnt := 0
 	for _, i := range b.Instrs {
-		if _, ok := i.(*ChangeType); ok {
+		if _, ok := i.(*ssa.ChangeType); ok {
 			cnt++
 		}
 	}
@@ -310,13 +255,9 @@ func Foo[T any, S any](t T, s S) {
 	Foo[T, S](t, s)
 }
 `
-	lprog, err := loadProgram(input)
-	if err != err {
-		t.Fatal(err)
-	}
+	p, _ := buildPackage(t, input, ssa.SanityCheckFunctions)
 
-	p := buildPackage(lprog, "p", SanityCheckFunctions)
-
+	all := ssautil.AllFunctions(p.Prog)
 	for _, test := range []struct {
 		orig      string
 		instances string
@@ -325,12 +266,12 @@ func Foo[T any, S any](t T, s S) {
 		{"Foo", "[p.Foo[S T] p.Foo[T S]]"},
 	} {
 		t.Run(test.orig, func(t *testing.T) {
-			f := p.Members[test.orig].(*Function)
+			f := p.Members[test.orig].(*ssa.Function)
 			if f == nil {
 				t.Fatalf("origin function not found")
 			}
 
-			instances := allInstances(f)
+			instances := instancesOf(all, f)
 			sort.Slice(instances, func(i, j int) bool { return instances[i].Name() < instances[j].Name() })
 
 			if got := fmt.Sprintf("%v", instances); !reflect.DeepEqual(got, test.instances) {
@@ -340,22 +281,14 @@ func Foo[T any, S any](t T, s S) {
 	}
 }
 
-// allInstances returns a new unordered array of all instances of the
-// specified function, if generic, or nil otherwise.
-//
-// Thread-safe.
-//
-// TODO(adonovan): delete this. The tests should be intensional (e.g.
-// "what instances of f are reachable?") not representational (e.g.
-// "what is the history of calls to Function.instance?").
-//
-// Acquires fn.generic.instancesMu.
-func allInstances(fn *Function) []*Function {
-	if fn.generic == nil {
-		return nil
+// instancesOf returns a new unordered slice of all instances of the
+// specified function g in fns.
+func instancesOf(fns map[*ssa.Function]bool, g *ssa.Function) []*ssa.Function {
+	var instances []*ssa.Function
+	for fn := range fns {
+		if fn != g && fn.Origin() == g {
+			instances = append(instances, fn)
+		}
 	}
-
-	fn.generic.instancesMu.Lock()
-	defer fn.generic.instancesMu.Unlock()
-	return mapValues(fn.generic.instances)
+	return instances
 }

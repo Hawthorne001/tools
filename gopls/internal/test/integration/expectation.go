@@ -342,9 +342,14 @@ func (e *Env) DoneDiagnosingChanges() Expectation {
 
 // AfterChange expects that the given expectations will be met after all
 // state-changing notifications have been processed by the server.
-//
-// It awaits the completion of all anticipated work before checking the given
-// expectations.
+// Specifically, it awaits the awaits completion of the process of diagnosis
+// after the following notifications, before checking the given expectations:
+//   - textDocument/didOpen
+//   - textDocument/didChange
+//   - textDocument/didSave
+//   - textDocument/didClose
+//   - workspace/didChangeWatchedFiles
+//   - workspace/didChangeConfiguration
 func (e *Env) AfterChange(expectations ...Expectation) {
 	e.T.Helper()
 	e.OnceMet(
@@ -407,7 +412,7 @@ func (e *Env) DoneWithClose() Expectation {
 // See CompletedWork.
 func StartedWork(title string, atLeast uint64) Expectation {
 	check := func(s State) Verdict {
-		if s.startedWork()[title] >= atLeast {
+		if s.startedWork[title] >= atLeast {
 			return Met
 		}
 		return Unmet
@@ -424,8 +429,8 @@ func StartedWork(title string, atLeast uint64) Expectation {
 // progress notification title to identify the work we expect to be completed.
 func CompletedWork(title string, count uint64, atLeast bool) Expectation {
 	check := func(s State) Verdict {
-		completed := s.completedWork()
-		if completed[title] == count || atLeast && completed[title] > count {
+		completed := s.completedWork[title]
+		if completed == count || atLeast && completed > count {
 			return Met
 		}
 		return Unmet
@@ -447,13 +452,13 @@ type WorkStatus struct {
 	EndMsg string
 }
 
-// CompletedProgress expects that workDone progress is complete for the given
+// CompletedProgressToken expects that workDone progress is complete for the given
 // progress token. When non-nil WorkStatus is provided, it will be filled
 // when the expectation is met.
 //
 // If the token is not a progress token that the client has seen, this
 // expectation is Unmeetable.
-func CompletedProgress(token protocol.ProgressToken, into *WorkStatus) Expectation {
+func CompletedProgressToken(token protocol.ProgressToken, into *WorkStatus) Expectation {
 	check := func(s State) Verdict {
 		work, ok := s.work[token]
 		if !ok {
@@ -469,6 +474,44 @@ func CompletedProgress(token protocol.ProgressToken, into *WorkStatus) Expectati
 		return Unmet
 	}
 	desc := fmt.Sprintf("completed work for token %v", token)
+	return Expectation{
+		Check:       check,
+		Description: desc,
+	}
+}
+
+// CompletedProgress expects that there is exactly one workDone progress with
+// the given title, and is satisfied when that progress completes. If it is
+// met, the corresponding status is written to the into argument.
+//
+// TODO(rfindley): refactor to eliminate the redundancy with CompletedWork.
+// This expectation is a vestige of older workarounds for asynchronous command
+// execution.
+func CompletedProgress(title string, into *WorkStatus) Expectation {
+	check := func(s State) Verdict {
+		var work *workProgress
+		for _, w := range s.work {
+			if w.title == title {
+				if work != nil {
+					// TODO(rfindley): refactor to allow the verdict to explain this result
+					return Unmeetable // multiple matches
+				}
+				work = w
+			}
+		}
+		if work == nil {
+			return Unmeetable // zero matches
+		}
+		if work.complete {
+			if into != nil {
+				into.Msg = work.msg
+				into.EndMsg = work.endMsg
+			}
+			return Met
+		}
+		return Unmet
+	}
+	desc := fmt.Sprintf("exactly 1 completed workDoneProgress with title %v", title)
 	return Expectation{
 		Check:       check,
 		Description: desc,

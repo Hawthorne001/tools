@@ -7,6 +7,7 @@ package misc
 import (
 	"testing"
 
+	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/test/compare"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 
@@ -49,7 +50,7 @@ func Foo() {
 
 			runner.Run(t, basic, func(t *testing.T, env *Env) {
 				env.OpenFile("main.go")
-				fixes, err := env.Editor.CodeActions(env.Ctx, env.RegexpSearch("main.go", "Info{}"), nil, protocol.RefactorRewrite)
+				fixes, err := env.Editor.CodeActions(env.Ctx, env.RegexpSearch("main.go", "Info{}"), nil, settings.RefactorRewriteFillStruct)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -115,7 +116,7 @@ func Foo() error {
 			ReadDiagnostics("main.go", &d),
 		)
 		var quickFixes []*protocol.CodeAction
-		for _, act := range env.CodeAction("main.go", d.Diagnostics) {
+		for _, act := range env.CodeActionForFile("main.go", d.Diagnostics) {
 			if act.Kind == protocol.QuickFix {
 				act := act // remove in go1.22
 				quickFixes = append(quickFixes, &act)
@@ -152,7 +153,7 @@ func _() {
 	`
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("external.go")
-		_, err := env.Editor.CodeAction(env.Ctx, env.RegexpSearch("external.go", "z"), nil)
+		_, err := env.Editor.CodeAction(env.Ctx, env.RegexpSearch("external.go", "z"), nil, protocol.CodeActionUnknownTrigger)
 		if err != nil {
 			t.Fatal(err)
 		}

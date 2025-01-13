@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/internal/aliases"
 	"golang.org/x/tools/internal/typeparams"
 )
 
@@ -423,7 +422,7 @@ func (st *falconState) expr(e ast.Expr) (res any) { // = types.TypeAndValue | as
 		if e.Type != nil {
 			_ = st.expr(e.Type)
 		}
-		t := aliases.Unalias(typeparams.Deref(tv.Type))
+		t := types.Unalias(typeparams.Deref(tv.Type))
 		var uniques []ast.Expr
 		for _, elt := range e.Elts {
 			if kv, ok := elt.(*ast.KeyValueExpr); ok {
@@ -447,7 +446,7 @@ func (st *falconState) expr(e ast.Expr) (res any) { // = types.TypeAndValue | as
 			// - for an array or *array, use [n]int.
 			// The last two entail progressively stronger index checks.
 			var ct ast.Expr // type syntax for constraint
-			switch t := t.(type) {
+			switch t := typeparams.CoreType(t).(type) {
 			case *types.Map:
 				if types.IsInterface(t.Key()) {
 					ct = &ast.MapType{
@@ -466,7 +465,7 @@ func (st *falconState) expr(e ast.Expr) (res any) { // = types.TypeAndValue | as
 					Elt: makeIdent(st.int),
 				}
 			default:
-				panic(t)
+				panic(fmt.Sprintf("%T: %v", t, t))
 			}
 			st.emitUnique(ct, uniques)
 		}

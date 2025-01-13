@@ -31,7 +31,6 @@ import (
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/util/browser"
 	bugpkg "golang.org/x/tools/gopls/internal/util/bug"
-	"golang.org/x/tools/gopls/internal/util/constraints"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/tool"
@@ -75,7 +74,7 @@ type Application struct {
 	editFlags *EditFlags
 }
 
-// EditFlags defines flags common to {fix,format,imports,rename}
+// EditFlags defines flags common to {code{action,lens},format,imports,rename}
 // that control how edits are applied to the client's files.
 //
 // The type is exported for flag reflection.
@@ -95,9 +94,8 @@ func (app *Application) verbose() bool {
 }
 
 // New returns a new Application ready to run.
-func New(options func(*settings.Options)) *Application {
+func New() *Application {
 	app := &Application{
-		options: options,
 		OCAgent: "off", //TODO: Remove this line to default the exporter to on
 
 		Serve: Serve{
@@ -131,6 +129,10 @@ gopls is a Go language server.
 It is typically used with an editor to provide language features. When no
 command is specified, gopls will default to the 'serve' command. The language
 features can also be accessed via the gopls command-line interface.
+
+For documentation of all its features, see:
+
+   https://github.com/golang/tools/blob/master/gopls/doc/features
 
 Usage:
   gopls help [<subject>]
@@ -281,9 +283,11 @@ func (app *Application) featureCommands() []tool.Application {
 	return []tool.Application{
 		&callHierarchy{app: app},
 		&check{app: app},
+		&codeaction{app: app},
 		&codelens{app: app},
 		&definition{app: app},
 		&execute{app: app},
+		&fix{app: app}, // (non-functional)
 		&foldingRanges{app: app},
 		&format{app: app},
 		&highlight{app: app},
@@ -298,7 +302,6 @@ func (app *Application) featureCommands() []tool.Application {
 		&semtok{app: app},
 		&signature{app: app},
 		&stats{app: app},
-		&suggestedFix{app: app},
 		&symbols{app: app},
 
 		&workspaceSymbol{app: app},
@@ -311,40 +314,31 @@ var (
 )
 
 // connect creates and initializes a new in-process gopls session.
-//
-// If onProgress is set, it is called for each new progress notification.
-func (app *Application) connect(ctx context.Context, onProgress func(*protocol.ProgressParams)) (*connection, error) {
-	switch {
-	case app.Remote == "":
-		client := newClient(app, onProgress)
+func (app *Application) connect(ctx context.Context) (*connection, error) {
+	client := newClient(app)
+	var svr protocol.Server
+	if app.Remote == "" {
+		// local
 		options := settings.DefaultOptions(app.options)
-		server := server.New(cache.NewSession(ctx, cache.New(nil)), client, options)
-		conn := newConnection(server, client)
-		if err := conn.initialize(protocol.WithClient(ctx, client), app.options); err != nil {
+		svr = server.New(cache.NewSession(ctx, cache.New(nil)), client, options)
+		ctx = protocol.WithClient(ctx, client)
+
+	} else {
+		// remote
+		netConn, err := lsprpc.ConnectToRemote(ctx, app.Remote)
+		if err != nil {
 			return nil, err
 		}
-		return conn, nil
-
-	default:
-		return app.connectRemote(ctx, app.Remote)
+		stream := jsonrpc2.NewHeaderStream(netConn)
+		jsonConn := jsonrpc2.NewConn(stream)
+		svr = protocol.ServerDispatcher(jsonConn)
+		ctx = protocol.WithClient(ctx, client)
+		jsonConn.Go(ctx,
+			protocol.Handlers(
+				protocol.ClientHandler(client, jsonrpc2.MethodNotFound)))
 	}
-}
-
-func (app *Application) connectRemote(ctx context.Context, remote string) (*connection, error) {
-	conn, err := lsprpc.ConnectToRemote(ctx, remote)
-	if err != nil {
-		return nil, err
-	}
-	stream := jsonrpc2.NewHeaderStream(conn)
-	cc := jsonrpc2.NewConn(stream)
-	server := protocol.ServerDispatcher(cc)
-	client := newClient(app, nil)
-	connection := newConnection(server, client)
-	ctx = protocol.WithClient(ctx, connection.client)
-	cc.Go(ctx,
-		protocol.Handlers(
-			protocol.ClientHandler(client, jsonrpc2.MethodNotFound)))
-	return connection, connection.initialize(ctx, app.options)
+	conn := newConnection(svr, client)
+	return conn, conn.initialize(ctx, app.options)
 }
 
 func (c *connection) initialize(ctx context.Context, options func(*settings.Options)) error {
@@ -370,12 +364,14 @@ func (c *connection) initialize(ctx context.Context, options func(*settings.Opti
 	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = &protocol.Or_ClientSemanticTokensRequestOptions_full{Value: true}
 	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = protocol.SemanticTypes()
 	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = protocol.SemanticModifiers()
-
-	// If the subcommand has registered a progress handler, report the progress
-	// capability.
-	if c.client.onProgress != nil {
-		params.Capabilities.Window.WorkDoneProgress = true
+	params.Capabilities.TextDocument.CodeAction = protocol.CodeActionClientCapabilities{
+		CodeActionLiteralSupport: protocol.ClientCodeActionLiteralOptions{
+			CodeActionKind: protocol.ClientCodeActionKindOptions{
+				ValueSet: []protocol.CodeActionKind{protocol.Empty}, // => all
+			},
+		},
 	}
+	params.Capabilities.Window.WorkDoneProgress = true
 
 	params.InitializationOptions = map[string]interface{}{
 		"symbolMatcher": string(opts.SymbolMatcher),
@@ -396,25 +392,29 @@ type connection struct {
 
 // cmdClient defines the protocol.Client interface behavior of the gopls CLI tool.
 type cmdClient struct {
-	app        *Application
-	onProgress func(*protocol.ProgressParams)
+	app *Application
 
-	filesMu sync.Mutex // guards files map and each cmdFile.diagnostics
+	progressMu sync.Mutex
+	iwlToken   protocol.ProgressToken
+	iwlDone    chan struct{}
+
+	filesMu sync.Mutex // guards files map
 	files   map[protocol.DocumentURI]*cmdFile
 }
 
 type cmdFile struct {
-	uri         protocol.DocumentURI
-	mapper      *protocol.Mapper
-	err         error
-	diagnostics []protocol.Diagnostic
+	uri           protocol.DocumentURI
+	mapper        *protocol.Mapper
+	err           error
+	diagnosticsMu sync.Mutex
+	diagnostics   []protocol.Diagnostic
 }
 
-func newClient(app *Application, onProgress func(*protocol.ProgressParams)) *cmdClient {
+func newClient(app *Application) *cmdClient {
 	return &cmdClient{
-		app:        app,
-		onProgress: onProgress,
-		files:      make(map[protocol.DocumentURI]*cmdFile),
+		app:     app,
+		files:   make(map[protocol.DocumentURI]*cmdFile),
+		iwlDone: make(chan struct{}),
 	}
 }
 
@@ -423,6 +423,10 @@ func newConnection(server protocol.Server, client *cmdClient) *connection {
 		Server: server,
 		client: client,
 	}
+}
+
+func (c *cmdClient) TextDocumentContentRefresh(context.Context, *protocol.TextDocumentContentRefreshParams) error {
+	return nil
 }
 
 func (c *cmdClient) CodeLensRefresh(context.Context) error { return nil }
@@ -511,36 +515,67 @@ func (c *cmdClient) ApplyEdit(ctx context.Context, p *protocol.ApplyWorkspaceEdi
 // applyWorkspaceEdit applies a complete WorkspaceEdit to the client's
 // files, honoring the preferred edit mode specified by cli.app.editMode.
 // (Used by rename and by ApplyEdit downcalls.)
-func (cli *cmdClient) applyWorkspaceEdit(edit *protocol.WorkspaceEdit) error {
-	var orderedURIs []protocol.DocumentURI
-	edits := map[protocol.DocumentURI][]protocol.TextEdit{}
-	for _, c := range edit.DocumentChanges {
-		if c.TextDocumentEdit != nil {
-			uri := c.TextDocumentEdit.TextDocument.URI
-			edits[uri] = append(edits[uri], protocol.AsTextEdits(c.TextDocumentEdit.Edits)...)
-			orderedURIs = append(orderedURIs, uri)
-		}
-		if c.RenameFile != nil {
-			return fmt.Errorf("client does not support file renaming (%s -> %s)",
-				c.RenameFile.OldURI,
-				c.RenameFile.NewURI)
-		}
+//
+// See also:
+//   - changedFiles in ../test/marker/marker_test.go for the golden-file capturing variant
+//   - applyWorkspaceEdit in ../test/integration/fake/editor.go for the Editor variant
+func (cli *cmdClient) applyWorkspaceEdit(wsedit *protocol.WorkspaceEdit) error {
+
+	create := func(uri protocol.DocumentURI, content []byte) error {
+		edits := []diff.Edit{{Start: 0, End: 0, New: string(content)}}
+		return updateFile(uri.Path(), nil, content, edits, cli.app.editFlags)
 	}
-	sortSlice(orderedURIs)
-	for _, uri := range orderedURIs {
-		f := cli.openFile(uri)
-		if f.err != nil {
-			return f.err
-		}
-		if err := applyTextEdits(f.mapper, edits[uri], cli.app.editFlags); err != nil {
-			return err
+
+	delete := func(uri protocol.DocumentURI, content []byte) error {
+		edits := []diff.Edit{{Start: 0, End: len(content), New: ""}}
+		return updateFile(uri.Path(), content, nil, edits, cli.app.editFlags)
+	}
+
+	for _, c := range wsedit.DocumentChanges {
+		switch {
+		case c.TextDocumentEdit != nil:
+			f := cli.openFile(c.TextDocumentEdit.TextDocument.URI)
+			if f.err != nil {
+				return f.err
+			}
+			// TODO(adonovan): sanity-check c.TextDocumentEdit.TextDocument.Version
+			edits := protocol.AsTextEdits(c.TextDocumentEdit.Edits)
+			if err := applyTextEdits(f.mapper, edits, cli.app.editFlags); err != nil {
+				return err
+			}
+
+		case c.CreateFile != nil:
+			if err := create(c.CreateFile.URI, []byte{}); err != nil {
+				return err
+			}
+
+		case c.RenameFile != nil:
+			// Analyze as creation + deletion. (NB: loses file mode.)
+			f := cli.openFile(c.RenameFile.OldURI)
+			if f.err != nil {
+				return f.err
+			}
+			if err := create(c.RenameFile.NewURI, f.mapper.Content); err != nil {
+				return err
+			}
+			if err := delete(f.mapper.URI, f.mapper.Content); err != nil {
+				return err
+			}
+
+		case c.DeleteFile != nil:
+			f := cli.openFile(c.DeleteFile.URI)
+			if f.err != nil {
+				return f.err
+			}
+			if err := delete(f.mapper.URI, f.mapper.Content); err != nil {
+				return err
+			}
+
+		default:
+			return fmt.Errorf("unknown DocumentChange: %#v", c)
 		}
 	}
 	return nil
-}
-
-func sortSlice[T constraints.Ordered](slice []T) {
-	sort.Slice(slice, func(i, j int) bool { return slice[i] < slice[j] })
 }
 
 // applyTextEdits applies a list of edits to the mapper file content,
@@ -549,30 +584,46 @@ func applyTextEdits(mapper *protocol.Mapper, edits []protocol.TextEdit, flags *E
 	if len(edits) == 0 {
 		return nil
 	}
-	newContent, renameEdits, err := protocol.ApplyEdits(mapper, edits)
+	newContent, diffEdits, err := protocol.ApplyEdits(mapper, edits)
 	if err != nil {
 		return err
 	}
+	return updateFile(mapper.URI.Path(), mapper.Content, newContent, diffEdits, flags)
+}
 
-	filename := mapper.URI.Path()
-
+// updateFile performs a content update operation on the specified file.
+// If the old content is nil, the operation creates the file.
+// If the new content is nil, the operation deletes the file.
+// The flags control whether the operation is written, or merely listed, diffed, or printed.
+func updateFile(filename string, old, new []byte, edits []diff.Edit, flags *EditFlags) error {
 	if flags.List {
 		fmt.Println(filename)
 	}
 
 	if flags.Write {
-		if flags.Preserve {
-			if err := os.Rename(filename, filename+".orig"); err != nil {
+		if flags.Preserve && old != nil { // edit or delete
+			if err := os.WriteFile(filename+".orig", old, 0666); err != nil {
 				return err
 			}
 		}
-		if err := os.WriteFile(filename, newContent, 0644); err != nil {
-			return err
+
+		if new != nil {
+			// create or edit
+			if err := os.WriteFile(filename, new, 0666); err != nil {
+				return err
+			}
+		} else {
+			// delete
+			if err := os.Remove(filename); err != nil {
+				return err
+			}
 		}
 	}
 
 	if flags.Diff {
-		unified, err := diff.ToUnified(filename+".orig", filename, string(mapper.Content), renameEdits, diff.DefaultContextLines)
+		// For diffing, creations and deletions are equivalent
+		// updating an empty file and making an existing file empty.
+		unified, err := diff.ToUnified(filename+".orig", filename, string(old), edits, diff.DefaultContextLines)
 		if err != nil {
 			return err
 		}
@@ -580,9 +631,11 @@ func applyTextEdits(mapper *protocol.Mapper, edits []protocol.TextEdit, flags *E
 	}
 
 	// No flags: just print edited file content.
-	// TODO(adonovan): how is this ever useful with multiple files?
+	//
+	// This makes no sense for multiple files.
+	// (We should probably change the default to -diff.)
 	if !(flags.List || flags.Write || flags.Diff) {
-		os.Stdout.Write(newContent)
+		os.Stdout.Write(new)
 	}
 
 	return nil
@@ -595,9 +648,11 @@ func (c *cmdClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishD
 	}
 
 	c.filesMu.Lock()
-	defer c.filesMu.Unlock()
-
 	file := c.getFile(p.URI)
+	c.filesMu.Unlock()
+
+	file.diagnosticsMu.Lock()
+	defer file.diagnosticsMu.Unlock()
 	file.diagnostics = append(file.diagnostics, p.Diagnostics...)
 
 	// Perform a crude in-place deduplication.
@@ -624,8 +679,31 @@ func (c *cmdClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishD
 }
 
 func (c *cmdClient) Progress(_ context.Context, params *protocol.ProgressParams) error {
-	if c.onProgress != nil {
-		c.onProgress(params)
+	if _, ok := params.Token.(string); !ok {
+		return fmt.Errorf("unexpected progress token: %[1]T %[1]v", params.Token)
+	}
+
+	switch v := params.Value.(type) {
+	case *protocol.WorkDoneProgressBegin:
+		if v.Title == server.DiagnosticWorkTitle(server.FromInitialWorkspaceLoad) {
+			c.progressMu.Lock()
+			c.iwlToken = params.Token
+			c.progressMu.Unlock()
+		}
+
+	case *protocol.WorkDoneProgressReport:
+		if c.app.Verbose {
+			fmt.Fprintln(os.Stderr, v.Message)
+		}
+
+	case *protocol.WorkDoneProgressEnd:
+		c.progressMu.Lock()
+		iwlToken := c.iwlToken
+		c.progressMu.Unlock()
+
+		if params.Token == iwlToken {
+			close(c.iwlDone)
+		}
 	}
 	return nil
 }
@@ -725,16 +803,10 @@ func (c *connection) semanticTokens(ctx context.Context, p *protocol.SemanticTok
 }
 
 func (c *connection) diagnoseFiles(ctx context.Context, files []protocol.DocumentURI) error {
-	cmd, err := command.NewDiagnoseFilesCommand("Diagnose files", command.DiagnoseFilesArgs{
+	cmd := command.NewDiagnoseFilesCommand("Diagnose files", command.DiagnoseFilesArgs{
 		Files: files,
 	})
-	if err != nil {
-		return err
-	}
-	_, err = c.ExecuteCommand(ctx, &protocol.ExecuteCommandParams{
-		Command:   cmd.Command,
-		Arguments: cmd.Arguments,
-	})
+	_, err := c.executeCommand(ctx, cmd)
 	return err
 }
 
@@ -840,4 +912,18 @@ func pointPosition(m *protocol.Mapper, p point) (protocol.Position, error) {
 		return m.OffsetPosition(p.Offset())
 	}
 	return protocol.Position{}, fmt.Errorf("point has neither offset nor line/column")
+}
+
+// TODO(adonovan): delete in 2025.
+type fix struct{ app *Application }
+
+func (*fix) Name() string       { return "fix" }
+func (cmd *fix) Parent() string { return cmd.app.Name() }
+func (*fix) Usage() string      { return "" }
+func (*fix) ShortHelp() string  { return "apply suggested fixes (obsolete)" }
+func (*fix) DetailedHelp(flags *flag.FlagSet) {
+	fmt.Fprintf(flags.Output(), `No longer supported; use "gopls codeaction" instead.`)
+}
+func (*fix) Run(ctx context.Context, args ...string) error {
+	return tool.CommandLineErrorf(`no longer supported; use "gopls codeaction" instead`)
 }

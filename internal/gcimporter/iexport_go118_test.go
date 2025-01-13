@@ -96,18 +96,19 @@ func testExportSrc(t *testing.T, src []byte) {
 	testPkgData(t, fset, version, pkg, data)
 }
 
-func TestImportTypeparamTests(t *testing.T) {
+func TestIndexedImportTypeparamTests(t *testing.T) {
 	testenv.NeedsGoBuild(t) // to find stdlib export data in the build cache
+	testenv.NeedsGOROOTDir(t, "test")
 
+	testAliases(t, testIndexedImportTypeparamTests)
+}
+
+func testIndexedImportTypeparamTests(t *testing.T) {
 	// Check go files in test/typeparam.
 	rootDir := filepath.Join(runtime.GOROOT(), "test", "typeparam")
 	list, err := os.ReadDir(rootDir)
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	if isUnifiedBuilder() {
-		t.Skip("unified export data format is currently unsupported")
 	}
 
 	for _, entry := range list {

@@ -17,9 +17,10 @@ import (
 	"golang.org/x/tools/gopls/internal/golang/completion/snippet"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/internal/aliases"
+	"golang.org/x/tools/gopls/internal/util/typesutil"
 	"golang.org/x/tools/internal/event"
 	"golang.org/x/tools/internal/imports"
+	"golang.org/x/tools/internal/typesinternal"
 )
 
 var (
@@ -50,7 +51,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 
 	var (
 		label         = cand.name
-		detail        = types.TypeString(obj.Type(), c.qf)
+		detail        = types.TypeString(obj.Type(), c.qual)
 		insert        = label
 		kind          = protocol.TextCompletion
 		snip          snippet.Builder
@@ -60,19 +61,17 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 		detail = ""
 	}
 	if isTypeName(obj) && c.wantTypeParams() {
-		x := cand.obj.(*types.TypeName)
-		if named, ok := aliases.Unalias(x.Type()).(*types.Named); ok {
-			tp := named.TypeParams()
-			label += golang.FormatTypeParams(tp)
-			insert = label // maintain invariant above (label == insert)
-		}
+		// obj is a *types.TypeName, so its type must be Alias|Named.
+		tparams := typesinternal.TypeParams(obj.Type().(typesinternal.NamedOrAlias))
+		label += typesutil.FormatTypeParams(tparams)
+		insert = label // maintain invariant above (label == insert)
 	}
 
 	snip.WriteText(insert)
 
 	switch obj := obj.(type) {
 	case *types.TypeName:
-		detail, kind = golang.FormatType(obj.Type(), c.qf)
+		detail, kind = golang.FormatType(obj.Type(), c.qual)
 	case *types.Const:
 		kind = protocol.ConstantCompletion
 	case *types.Var:
@@ -80,7 +79,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 			detail = "struct{...}" // for anonymous unaliased struct types
 		} else if obj.IsField() {
 			var err error
-			detail, err = golang.FormatVarType(ctx, c.snapshot, c.pkg, obj, c.qf, c.mq)
+			detail, err = golang.FormatVarType(ctx, c.snapshot, c.pkg, obj, c.qual, c.mq)
 			if err != nil {
 				return CompletionItem{}, err
 			}
@@ -95,7 +94,7 @@ func (c *completer) item(ctx context.Context, cand candidate) (CompletionItem, e
 			break
 		}
 	case *types.Func:
-		if obj.Type().(*types.Signature).Recv() == nil {
+		if obj.Signature().Recv() == nil {
 			kind = protocol.FunctionCompletion
 		} else {
 			kind = protocol.MethodCompletion
@@ -129,7 +128,7 @@ Suffixes:
 		switch mod {
 		case invoke:
 			if sig, ok := funcType.Underlying().(*types.Signature); ok {
-				s, err := golang.NewSignature(ctx, c.snapshot, c.pkg, sig, nil, c.qf, c.mq)
+				s, err := golang.NewSignature(ctx, c.snapshot, c.pkg, sig, nil, c.qual, c.mq)
 				if err != nil {
 					return CompletionItem{}, err
 				}
@@ -197,24 +196,9 @@ Suffixes:
 	}
 
 	if cand.convertTo != nil {
-		typeName := types.TypeString(cand.convertTo, c.qf)
-
-		switch t := cand.convertTo.(type) {
-		// We need extra parens when casting to these types. For example,
-		// we need "(*int)(foo)", not "*int(foo)".
-		case *types.Pointer, *types.Signature:
-			typeName = "(" + typeName + ")"
-		case *types.Basic:
-			// If the types are incompatible (as determined by typeMatches), then we
-			// must need a conversion here. However, if the target type is untyped,
-			// don't suggest converting to e.g. "untyped float" (golang/go#62141).
-			if t.Info()&types.IsUntyped != 0 {
-				typeName = types.TypeString(types.Default(cand.convertTo), c.qf)
-			}
-		}
-
-		prefix = typeName + "(" + prefix
-		suffix = ")"
+		conv := c.formatConversion(cand.convertTo)
+		prefix = conv.prefix + prefix
+		suffix = conv.suffix
 	}
 
 	if prefix != "" {
@@ -289,6 +273,38 @@ Suffixes:
 	return item, nil
 }
 
+// conversionEdits represents the string edits needed to make a type conversion
+// of an expression.
+type conversionEdits struct {
+	prefix, suffix string
+}
+
+// formatConversion returns the edits needed to make a type conversion
+// expression, including parentheses if necessary.
+//
+// Returns empty conversionEdits if convertTo is nil.
+func (c *completer) formatConversion(convertTo types.Type) conversionEdits {
+	if convertTo == nil {
+		return conversionEdits{}
+	}
+
+	typeName := types.TypeString(convertTo, c.qual)
+	switch t := convertTo.(type) {
+	// We need extra parens when casting to these types. For example,
+	// we need "(*int)(foo)", not "*int(foo)".
+	case *types.Pointer, *types.Signature:
+		typeName = "(" + typeName + ")"
+	case *types.Basic:
+		// If the types are incompatible (as determined by typeMatches), then we
+		// must need a conversion here. However, if the target type is untyped,
+		// don't suggest converting to e.g. "untyped float" (golang/go#62141).
+		if t.Info()&types.IsUntyped != 0 {
+			typeName = types.TypeString(types.Default(convertTo), c.qual)
+		}
+	}
+	return conversionEdits{prefix: typeName + "(", suffix: ")"}
+}
+
 // importEdits produces the text edits necessary to add the given import to the current file.
 func (c *completer) importEdits(imp *importInfo) ([]protocol.TextEdit, error) {
 	if imp == nil {
@@ -300,7 +316,7 @@ func (c *completer) importEdits(imp *importInfo) ([]protocol.TextEdit, error) {
 		return nil, err
 	}
 
-	return golang.ComputeOneImportFixEdits(c.snapshot, pgf, &imports.ImportFix{
+	return golang.ComputeImportFixEdits(c.snapshot.Options().Local, pgf.Src, &imports.ImportFix{
 		StmtInfo: imports.ImportInfo{
 			ImportPath: imp.importPath,
 			Name:       imp.name,
@@ -412,8 +428,8 @@ func inferableTypeParams(sig *types.Signature) map[*types.TypeParam]bool {
 			}
 		case *types.TypeParam:
 			free[t] = true
-		case *aliases.Alias:
-			visit(aliases.Unalias(t))
+		case *types.Alias:
+			visit(types.Unalias(t))
 		case *types.Named:
 			targs := t.TypeArgs()
 			for i := 0; i < targs.Len(); i++ {

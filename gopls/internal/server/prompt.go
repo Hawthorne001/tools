@@ -7,11 +7,15 @@ package server
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
+	"testing"
 	"time"
 
 	"golang.org/x/telemetry"
+	"golang.org/x/telemetry/counter"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
 )
@@ -23,13 +27,32 @@ import (
 // crash).
 const promptTimeout = 24 * time.Hour
 
+// gracePeriod is the amount of time we wait before sufficient telemetry data
+// is accumulated in the local directory, so users can have time to review
+// what kind of information will be collected and uploaded when prompting starts.
+const gracePeriod = 7 * 24 * time.Hour
+
+// samplesPerMille is the prompt probability.
+// Token is an integer between [1, 1000] and is assigned when maybePromptForTelemetry
+// is called first time. Only the user with a token ∈ [1, samplesPerMille]
+// will be considered for prompting.
+const samplesPerMille = 10 // 1% sample rate
+
 // The following constants are used for testing telemetry integration.
 const (
 	TelemetryPromptWorkTitle    = "Checking telemetry prompt"     // progress notification title, for awaiting in tests
 	GoplsConfigDirEnvvar        = "GOPLS_CONFIG_DIR"              // overridden for testing
 	FakeTelemetryModefileEnvvar = "GOPLS_FAKE_TELEMETRY_MODEFILE" // overridden for testing
+	FakeSamplesPerMille         = "GOPLS_FAKE_SAMPLES_PER_MILLE"  // overridden for testing
 	TelemetryYes                = "Yes, I'd like to help."
 	TelemetryNo                 = "No, thanks."
+)
+
+// The following environment variables may be set by the client.
+// Exported for testing telemetry integration.
+const (
+	GoTelemetryGoplsClientStartTimeEnvvar = "GOTELEMETRY_GOPLS_CLIENT_START_TIME" // telemetry start time recored in client
+	GoTelemetryGoplsClientTokenEnvvar     = "GOTELEMETRY_GOPLS_CLIENT_TOKEN"      // sampling token
 )
 
 // getenv returns the effective environment variable value for the provided
@@ -40,19 +63,6 @@ func (s *server) getenv(key string) string {
 		return v
 	}
 	return os.Getenv(key)
-}
-
-// configDir returns the root of the gopls configuration dir. By default this
-// is os.UserConfigDir/gopls, but it may be overridden for tests.
-func (s *server) configDir() (string, error) {
-	if d := s.getenv(GoplsConfigDirEnvvar); d != "" {
-		return d, nil
-	}
-	userDir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(userDir, "gopls"), nil
 }
 
 // telemetryMode returns the current effective telemetry mode.
@@ -91,7 +101,117 @@ func (s *server) maybePromptForTelemetry(ctx context.Context, enabled bool) {
 		defer work.End(ctx, "Done.")
 	}
 
-	if !enabled { // check this after the work progress message for testing.
+	errorf := func(format string, args ...any) {
+		err := fmt.Errorf(format, args...)
+		event.Error(ctx, "telemetry prompt failed", err)
+	}
+
+	// Only prompt if we can read/write the prompt config file.
+	configDir := s.getenv(GoplsConfigDirEnvvar) // set for testing
+	if configDir == "" && testing.Testing() {
+		// Unless tests set GoplsConfigDirEnvvar, the prompt is a no op.
+		// We don't want tests to interact with os.UserConfigDir().
+		return
+	}
+	if configDir == "" {
+		userDir, err := os.UserConfigDir()
+		if err != nil {
+			errorf("unable to determine user config dir: %v", err)
+			return
+		}
+		configDir = filepath.Join(userDir, "gopls")
+	}
+
+	// Read the current prompt file.
+
+	var (
+		promptDir  = filepath.Join(configDir, "prompt")    // prompt configuration directory
+		promptFile = filepath.Join(promptDir, "telemetry") // telemetry prompt file
+	)
+
+	// prompt states, stored in the prompt file
+	const (
+		pUnknown  = ""        // first time
+		pNotReady = "-"       // user is not asked yet (either not sampled or not past the grace period)
+		pYes      = "yes"     // user said yes
+		pNo       = "no"      // user said no
+		pPending  = "pending" // current prompt is still pending
+		pFailed   = "failed"  // prompt was asked but failed
+	)
+	validStates := map[string]bool{
+		pNotReady: true,
+		pYes:      true,
+		pNo:       true,
+		pPending:  true,
+		pFailed:   true,
+	}
+
+	// Parse the current prompt file.
+	var (
+		state    = pUnknown
+		attempts = 0 // number of times we've asked already
+
+		// the followings are recorded after gopls v0.17+.
+		token        = 0   // valid token is [1, 1000]
+		creationTime int64 // unix time sec
+	)
+	if content, err := os.ReadFile(promptFile); err == nil {
+		if n, _ := fmt.Sscanf(string(content), "%s %d %d %d", &state, &attempts, &creationTime, &token); (n == 2 || n == 4) && validStates[state] {
+			// successfully parsed!
+			//  ~ v0.16: must have only two fields, state and attempts.
+			//  v0.17 ~: must have all four fields.
+		} else {
+			state, attempts, creationTime, token = pUnknown, 0, 0, 0
+			// TODO(hyangah): why do we want to present this as an error to user?
+			errorf("malformed prompt result %q", string(content))
+		}
+	} else if !os.IsNotExist(err) {
+		errorf("reading prompt file: %v", err)
+		// Something went wrong. Since we don't know how many times we've asked the
+		// prompt, err on the side of not asking.
+		//
+		// But record this in telemetry, in case some users enable telemetry by
+		// other means.
+		counter.New("gopls/telemetryprompt/corrupted").Inc()
+		return
+	}
+
+	counter.New(fmt.Sprintf("gopls/telemetryprompt/attempts:%d", attempts)).Inc()
+
+	// Check terminal conditions.
+
+	if state == pYes {
+		// Prompt has been accepted.
+		//
+		// We record this counter for every gopls session, rather than when the
+		// prompt actually accepted below, because if we only recorded it in the
+		// counter file at the time telemetry is enabled, we'd never upload it,
+		// because we exclude any counter files that overlap with a time period
+		// that has telemetry uploading is disabled.
+		counter.New("gopls/telemetryprompt/accepted").Inc()
+		return
+	}
+	if state == pNo {
+		// Prompt has been declined. In most cases, this means we'll never see the
+		// counter below, but it's possible that the user may enable telemetry by
+		// other means later on. If we see a significant number of users that have
+		// accepted telemetry but declined the prompt, it may be an indication that
+		// the prompt is not working well.
+		counter.New("gopls/telemetryprompt/declined").Inc()
+		return
+	}
+	if attempts >= 5 { // pPending or pFailed
+		// We've tried asking enough; give up. Record that the prompt expired, in
+		// case the user decides to enable telemetry by other means later on.
+		// (see also the pNo case).
+		counter.New("gopls/telemetryprompt/expired").Inc()
+		return
+	}
+
+	// We only check enabled after (1) the work progress is started, and (2) the
+	// prompt file has been read. (1) is for testing purposes, and (2) is so that
+	// we record the "gopls/telemetryprompt/accepted" counter for every session.
+	if !enabled {
 		return // prompt is disabled
 	}
 
@@ -100,72 +220,48 @@ func (s *server) maybePromptForTelemetry(ctx context.Context, enabled bool) {
 		return
 	}
 
-	errorf := func(format string, args ...any) {
-		err := fmt.Errorf(format, args...)
-		event.Error(ctx, "telemetry prompt failed", err)
-	}
-
-	// Only prompt if we can read/write the prompt config file.
-	configDir, err := s.configDir()
-	if err != nil {
-		errorf("unable to determine config dir: %v", err)
-		return
-	}
-
-	var (
-		promptDir  = filepath.Join(configDir, "prompt")    // prompt configuration directory
-		promptFile = filepath.Join(promptDir, "telemetry") // telemetry prompt file
-	)
-
-	// prompt states, to be written to the prompt file
-	const (
-		pYes     = "yes"     // user said yes
-		pNo      = "no"      // user said no
-		pPending = "pending" // current prompt is still pending
-		pFailed  = "failed"  // prompt was asked but failed
-	)
-	validStates := map[string]bool{
-		pYes:     true,
-		pNo:      true,
-		pPending: true,
-		pFailed:  true,
-	}
-
-	// parse the current prompt file
-	var (
-		state    string
-		attempts = 0 // number of times we've asked already
-	)
-	if content, err := os.ReadFile(promptFile); err == nil {
-		if _, err := fmt.Sscanf(string(content), "%s %d", &state, &attempts); err == nil && validStates[state] {
-			if state == pYes || state == pNo {
-				// Prompt has been answered. Nothing to do.
-				return
-			}
-		} else {
-			state, attempts = "", 0
-			errorf("malformed prompt result %q", string(content))
-		}
-	} else if !os.IsNotExist(err) {
-		errorf("reading prompt file: %v", err)
-		// Something went wrong. Since we don't know how many times we've asked the
-		// prompt, err on the side of not spamming.
-		return
-	}
-
-	if attempts >= 5 {
-		// We've tried asking enough; give up.
-		return
-	}
-	if attempts == 0 {
-		// First time asking the prompt; we may need to make the prompt dir.
+	// Transition: pUnknown -> pNotReady
+	if state == pUnknown {
+		// First time; we need to make the prompt dir.
 		if err := os.MkdirAll(promptDir, 0777); err != nil {
 			errorf("creating prompt dir: %v", err)
 			return
 		}
+		state = pNotReady
 	}
 
-	// Acquire the lock and write "pending" to the prompt file before actually
+	// Correct missing values.
+	if creationTime == 0 {
+		creationTime = time.Now().Unix()
+		if v := s.getenv(GoTelemetryGoplsClientStartTimeEnvvar); v != "" {
+			if sec, err := strconv.ParseInt(v, 10, 64); err == nil && sec > 0 {
+				creationTime = sec
+			}
+		}
+	}
+	if token == 0 {
+		token = rand.Intn(1000) + 1
+		if v := s.getenv(GoTelemetryGoplsClientTokenEnvvar); v != "" {
+			if tok, err := strconv.Atoi(v); err == nil && 1 <= tok && tok <= 1000 {
+				token = tok
+			}
+		}
+	}
+
+	// Transition: pNotReady -> pPending if sampled
+	if state == pNotReady {
+		threshold := samplesPerMille
+		if v := s.getenv(FakeSamplesPerMille); v != "" {
+			if t, err := strconv.Atoi(v); err == nil {
+				threshold = t
+			}
+		}
+		if token <= threshold && time.Now().Unix()-creationTime > gracePeriod.Milliseconds()/1000 {
+			state = pPending
+		}
+	}
+
+	// Acquire the lock and write the updated state to the prompt file before actually
 	// prompting.
 	//
 	// This ensures that the prompt file is writeable, and that we increment the
@@ -178,16 +274,22 @@ func (s *server) maybePromptForTelemetry(ctx context.Context, enabled bool) {
 		return
 	}
 	if !ok {
-		// Another prompt is currently pending.
+		// Another process is making decision.
 		return
 	}
 	defer release()
 
-	attempts++
+	if state != pNotReady { // pPending or pFailed
+		attempts++
+	}
 
-	pendingContent := []byte(fmt.Sprintf("%s %d", pPending, attempts))
+	pendingContent := []byte(fmt.Sprintf("%s %d %d %d", state, attempts, creationTime, token))
 	if err := os.WriteFile(promptFile, pendingContent, 0666); err != nil {
 		errorf("writing pending state: %v", err)
+		return
+	}
+
+	if state == pNotReady {
 		return
 	}
 
@@ -249,7 +351,7 @@ Would you like to enable Go telemetry?
 			message(protocol.Error, fmt.Sprintf("Unrecognized response %q", item.Title))
 		}
 	}
-	resultContent := []byte(fmt.Sprintf("%s %d", result, attempts))
+	resultContent := []byte(fmt.Sprintf("%s %d %d %d", result, attempts, creationTime, token))
 	if err := os.WriteFile(promptFile, resultContent, 0666); err != nil {
 		errorf("error writing result state to prompt file: %v", err)
 	}

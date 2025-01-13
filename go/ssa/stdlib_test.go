@@ -35,7 +35,13 @@ func bytesAllocated() uint64 {
 	return stats.Alloc
 }
 
-// TestStdlib loads the entire standard library and its tools.
+// TestStdlib loads the entire standard library and its tools and all
+// their dependencies.
+//
+// (As of go1.23, std is transitively closed, so adding the -deps flag
+// doesn't increase its result set. The cmd pseudomodule of course
+// depends on a good chunk of std, but the std+cmd set is also
+// transitively closed, so long as -pgo=off.)
 //
 // Apart from a small number of internal packages that are not
 // returned by the 'std' query, the set is essentially transitively
@@ -48,6 +54,17 @@ func TestStdlib(t *testing.T) {
 // It may help reveal costs related to dependencies (e.g. unnecessary building).
 func TestNetHTTP(t *testing.T) {
 	testLoad(t, 120, "net/http")
+}
+
+// TestCycles loads two standard libraries that depend on the same
+// generic instantiations.
+// internal/trace/testtrace and net/http both depend on
+// slices.Contains[[]string string] and slices.Index[[]string string]
+// This can under some schedules create a cycle of dependencies
+// where both need to wait on the other to finish building.
+func TestCycles(t *testing.T) {
+	testenv.NeedsGo1Point(t, 23) // internal/trace/testtrace was added in 1.23.
+	testLoad(t, 120, "net/http", "internal/trace/testtrace")
 }
 
 func testLoad(t *testing.T, minPkgs int, patterns ...string) {
@@ -66,6 +83,9 @@ func testLoad(t *testing.T, minPkgs int, patterns ...string) {
 	pkgs, err := packages.Load(cfg, patterns...)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if packages.PrintErrors(pkgs) > 0 {
+		t.Fatal("there were errors loading the packages")
 	}
 
 	t1 := time.Now()
@@ -184,9 +204,13 @@ func srcFunctions(prog *ssa.Program, pkgs []*packages.Package) (res []*ssa.Funct
 				if decl, ok := decl.(*ast.FuncDecl); ok {
 					obj := pkg.TypesInfo.Defs[decl.Name].(*types.Func)
 					if obj == nil {
-						panic("nil *Func")
+						panic("nil *types.Func: " + decl.Name.Name)
 					}
-					addSrcFunc(prog.FuncValue(obj))
+					fn := prog.FuncValue(obj)
+					if fn == nil {
+						panic("nil *ssa.Function: " + obj.String())
+					}
+					addSrcFunc(fn)
 				}
 			}
 		}

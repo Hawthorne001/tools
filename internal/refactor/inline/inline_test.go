@@ -23,10 +23,10 @@ import (
 	"unsafe"
 
 	"golang.org/x/tools/go/ast/astutil"
-	"golang.org/x/tools/go/expect"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/internal/diff"
+	"golang.org/x/tools/internal/expect"
 	"golang.org/x/tools/internal/refactor/inline"
 	"golang.org/x/tools/internal/testenv"
 	"golang.org/x/tools/txtar"
@@ -86,7 +86,7 @@ func TestData(t *testing.T) {
 			for _, pkg := range pkgs {
 				for _, file := range pkg.Syntax {
 					// Read file content (for @inline regexp, and inliner).
-					content, err := os.ReadFile(pkg.Fset.File(file.Pos()).Name())
+					content, err := os.ReadFile(pkg.Fset.File(file.FileStart).Name())
 					if err != nil {
 						t.Error(err)
 						continue
@@ -95,7 +95,7 @@ func TestData(t *testing.T) {
 					// Read and process @inline notes.
 					notes, err := expect.ExtractGo(pkg.Fset, file)
 					if err != nil {
-						t.Errorf("parsing notes in %q: %v", pkg.Fset.File(file.Pos()).Name(), err)
+						t.Errorf("parsing notes in %q: %v", pkg.Fset.File(file.FileStart).Name(), err)
 						continue
 					}
 					for _, note := range notes {
@@ -157,7 +157,7 @@ func doInlineNote(logf func(string, ...any), pkg *packages.Package, file *ast.Fi
 	// Find extent of pattern match within commented line.
 	var startPos, endPos token.Pos
 	{
-		tokFile := pkg.Fset.File(file.Pos())
+		tokFile := pkg.Fset.File(file.FileStart)
 		lineStartOffset := int(tokFile.LineStart(posn.Line)) - tokFile.Base()
 		line := content[lineStartOffset:]
 		if i := bytes.IndexByte(line, '\n'); i >= 0 {
@@ -244,7 +244,7 @@ func doInlineNote(logf func(string, ...any), pkg *packages.Package, file *ast.Fi
 
 	// Do the inlining. For the purposes of the test,
 	// AnalyzeCallee and Inline are a single operation.
-	got, err := func() ([]byte, error) {
+	res, err := func() (*inline.Result, error) {
 		filename := calleePkg.Fset.File(calleeDecl.Pos()).Name()
 		content, err := os.ReadFile(filename)
 		if err != nil {
@@ -267,7 +267,7 @@ func doInlineNote(logf func(string, ...any), pkg *packages.Package, file *ast.Fi
 
 		check := checkNoMutation(caller.File)
 		defer check()
-		return inline.Inline(logf, caller, callee)
+		return inline.Inline(caller, callee, &inline.Options{Logf: logf})
 	}()
 	if err != nil {
 		if wantRE, ok := want.(*regexp.Regexp); ok {
@@ -280,6 +280,7 @@ func doInlineNote(logf func(string, ...any), pkg *packages.Package, file *ast.Fi
 	}
 
 	// Inline succeeded.
+	got := res.Content
 	if want, ok := want.([]byte); ok {
 		got = append(bytes.TrimSpace(got), '\n')
 		want = append(bytes.TrimSpace(want), '\n')
@@ -331,7 +332,7 @@ const funcName = "f"
 // strategy with the checklist of concerns enumerated in the package
 // doc comment.
 type testcase struct {
-	descr          string
+	descr          string // description; substrings enable options (e.g. "IgnoreEffects")
 	callee, caller string // Go source files (sans package decl) of caller, callee
 	want           string // expected new portion of caller file, or "error: regexp"
 }
@@ -413,52 +414,171 @@ func TestBasics(t *testing.T) {
 }
 
 func TestDuplicable(t *testing.T) {
-	runTests(t, []testcase{
-		{
-			"Empty strings are duplicable.",
-			`func f(s string) { print(s, s) }`,
-			`func _() { f("")  }`,
-			`func _() { print("", "") }`,
-		},
-		{
-			"Non-empty string literals are not duplicable.",
-			`func f(s string) { print(s, s) }`,
-			`func _() { f("hi")  }`,
-			`func _() {
+	t.Run("basic", func(t *testing.T) {
+		runTests(t, []testcase{
+			{
+				"Empty strings are duplicable.",
+				`func f(s string) { print(s, s) }`,
+				`func _() { f("")  }`,
+				`func _() { print("", "") }`,
+			},
+			{
+				"Non-empty string literals are not duplicable.",
+				`func f(s string) { print(s, s) }`,
+				`func _() { f("hi")  }`,
+				`func _() {
 	var s string = "hi"
 	print(s, s)
 }`,
-		},
-		{
-			"Empty array literals are duplicable.",
-			`func f(a [2]int) { print(a, a) }`,
-			`func _() { f([2]int{})  }`,
-			`func _() { print([2]int{}, [2]int{}) }`,
-		},
-		{
-			"Non-empty array literals are not duplicable.",
-			`func f(a [2]int) { print(a, a) }`,
-			`func _() { f([2]int{1, 2})  }`,
-			`func _() {
+			},
+			{
+				"Empty array literals are duplicable.",
+				`func f(a [2]int) { print(a, a) }`,
+				`func _() { f([2]int{})  }`,
+				`func _() { print([2]int{}, [2]int{}) }`,
+			},
+			{
+				"Non-empty array literals are not duplicable.",
+				`func f(a [2]int) { print(a, a) }`,
+				`func _() { f([2]int{1, 2})  }`,
+				`func _() {
 	var a [2]int = [2]int{1, 2}
 	print(a, a)
 }`,
-		},
-		{
-			"Empty struct literals are duplicable.",
-			`func f(s S) { print(s, s) }; type S struct { x int }`,
-			`func _() { f(S{})  }`,
-			`func _() { print(S{}, S{}) }`,
-		},
-		{
-			"Non-empty struct literals are not duplicable.",
-			`func f(s S) { print(s, s) }; type S struct { x int }`,
-			`func _() { f(S{x: 1})  }`,
-			`func _() {
+			},
+			{
+				"Empty struct literals are duplicable.",
+				`func f(s S) { print(s, s) }; type S struct { x int }`,
+				`func _() { f(S{})  }`,
+				`func _() { print(S{}, S{}) }`,
+			},
+			{
+				"Non-empty struct literals are not duplicable.",
+				`func f(s S) { print(s, s) }; type S struct { x int }`,
+				`func _() { f(S{x: 1})  }`,
+				`func _() {
 	var s S = S{x: 1}
 	print(s, s)
 }`,
-		},
+			},
+		})
+	})
+
+	t.Run("conversions", func(t *testing.T) {
+		runTests(t, []testcase{
+			{
+				"Conversions to integer are duplicable.",
+				`func f(i int) { print(i, i) }`,
+				`func _() { var i int8 = 1; f(int(i))  }`,
+				`func _() { var i int8 = 1; print(int(i), int(i)) }`,
+			},
+			{
+				"Implicit conversions from underlying types are duplicable.",
+				`func f(i I) { print(i, i) }; type I int; func print(args ...any) {}`,
+				`func _() { f(1)  }`,
+				`func _() { print(I(1), I(1)) }`,
+			},
+			{
+				"Conversions to array are duplicable.",
+				`func f(a [2]int) { print(a, a) }; type A [2]int`,
+				`func _() { var a A; f([2]int(a)) }`,
+				`func _() { var a A; print([2]int(a), [2]int(a)) }`,
+			},
+			{
+				"Conversions from array are duplicable.",
+				`func f(a A) { print(a, a) }; type A [2]int`,
+				`func _() { var a [2]int; f(A(a)) }`,
+				`func _() { var a [2]int; print(A(a), A(a)) }`,
+			},
+			{
+				"Conversions from byte slice to string are duplicable.",
+				`func f(s string) { print(s, s) }`,
+				`func _() { var b []byte; f(string(b)) }`,
+				`func _() { var b []byte; print(string(b), string(b)) }`,
+			},
+			{
+				"Conversions from string to byte slice are not duplicable.",
+				`func f(b []byte) { print(b, b) }`,
+				`func _() { var s string; f([]byte(s)) }`,
+				`func _() {
+	var s string
+	var b []byte = []byte(s)
+	print(b, b)
+}`,
+			},
+			{
+				"Conversions from string to uint8 slice are not duplicable.",
+				`func f(b []uint8) { print(b, b) }`,
+				`func _() { var s string; f([]uint8(s)) }`,
+				`func _() {
+	var s string
+	var b []uint8 = []uint8(s)
+	print(b, b)
+}`,
+			},
+			{
+				"Conversions from string to rune slice are not duplicable.",
+				`func f(r []rune) { print(r, r) }`,
+				`func _() { var s string; f([]rune(s)) }`,
+				`func _() {
+	var s string
+	var r []rune = []rune(s)
+	print(r, r)
+}`,
+			},
+			{
+				"Conversions from string to named type with underlying byte slice are not duplicable.",
+				`func f(b B) { print(b, b) }; type B []byte`,
+				`func _() { var s string; f(B(s)) }`,
+				`func _() {
+	var s string
+	var b B = B(s)
+	print(b, b)
+}`,
+			},
+			{
+				"Conversions from string to named type of string are duplicable.",
+				`func f(s S) { print(s, s) }; type S string`,
+				`func _() { var s string; f(S(s)) }`,
+				`func _() { var s string; print(S(s), S(s)) }`,
+			},
+			{
+				"Built-in function calls are not duplicable.",
+				`func f(i int) { print(i, i) }`,
+				`func _() { f(len(""))  }`,
+				`func _() {
+	var i int = len("")
+	print(i, i)
+}`,
+			},
+			{
+				"Built-in function calls are not duplicable.",
+				`func f(c complex128) { print(c, c) }`,
+				`func _() { f(complex(1.0, 2.0)) }`,
+				`func _() {
+	var c complex128 = complex(1.0, 2.0)
+	print(c, c)
+}`,
+			},
+			{
+				"Non built-in function calls are not duplicable.",
+				`func f(i int) { print(i, i) }
+//go:noinline
+func f1(i int) int { return i + 1 }`,
+				`func _() { f(f1(1))  }`,
+				`func _() {
+	var i int = f1(1)
+	print(i, i)
+}`,
+			},
+			{
+				"Conversions between function types are duplicable.",
+				`func f(f F) { print(f, f) }; type F func(); func f1() {}`,
+				`func _() { f(F(f1))  }`,
+				`func _() { print(F(f1), F(f1)) }`,
+			},
+		})
+
 	})
 }
 
@@ -611,13 +731,25 @@ func TestSubstitution(t *testing.T) {
 			`func _() { var local int; _ = local }`,
 		},
 		{
-			"Arguments that are used are detected",
+			"Arguments that are used by other arguments are detected",
 			`func f(x, y int) { print(x) }`,
 			`func _() { var z int; f(z, z) }`,
+			`func _() { var z int; print(z) }`,
+		},
+		{
+			"Arguments that are used by other variadic arguments are detected",
+			`func f(x int, ys ...int) { print(ys) }`,
+			`func _() { var z int; f(z, 1, 2, 3, z) }`,
+			`func _() { var z int; print([]int{1, 2, 3, z}) }`,
+		},
+		{
+			"Arguments that are used by other variadic arguments are detected, 2",
+			`func f(x int, ys ...int) { print(ys) }`,
+			`func _() { var z int; f(z) }`,
 			`func _() {
 	var z int
 	var _ int = z
-	print(z)
+	print([]int{})
 }`,
 		},
 		{
@@ -649,26 +781,26 @@ func TestSubstitution(t *testing.T) {
 func TestTailCallStrategy(t *testing.T) {
 	runTests(t, []testcase{
 		{
-			"Tail call.",
+			"simple",
 			`func f() int { return 1 }`,
 			`func _() int { return f() }`,
 			`func _() int { return 1 }`,
 		},
 		{
-			"Void tail call.",
+			"void",
 			`func f() { println() }`,
 			`func _() { f() }`,
 			`func _() { println() }`,
 		},
 		{
-			"Void tail call with defer.", // => literalized
+			"void with defer", // => literalized
 			`func f() { defer f(); println() }`,
 			`func _() { f() }`,
 			`func _() { func() { defer f(); println() }() }`,
 		},
 		// Tests for issue #63336:
 		{
-			"Tail call with non-trivial return conversion (caller.sig = callee.sig).",
+			"non-trivial return conversion (caller.sig = callee.sig)",
 			`func f() error { if true { return nil } else { return e } }; var e struct{error}`,
 			`func _() error { return f() }`,
 			`func _() error {
@@ -680,7 +812,7 @@ func TestTailCallStrategy(t *testing.T) {
 }`,
 		},
 		{
-			"Tail call with non-trivial return conversion (caller.sig != callee.sig).",
+			"non-trivial return conversion (caller.sig != callee.sig)",
 			`func f() error { return E{} }; type E struct{error}`,
 			`func _() any { return f() }`,
 			`func _() any { return error(E{}) }`,
@@ -724,11 +856,169 @@ func TestSpreadCalls(t *testing.T) {
 			`func _() (int, error) { return f() }`,
 			`func _() (int, error) { return 0, nil }`,
 		},
+	})
+}
+
+func TestAssignmentCallStrategy(t *testing.T) {
+	runTests(t, []testcase{
 		{
-			"Implicit return conversions defeat reduction of spread returns, for now.",
+			"splice: basic",
+			`func f(x int) (int, int) { return x, 2 }`,
+			`func _() { x, y := f(1); _, _ = x, y }`,
+			`func _() { x, y := 1, 2; _, _ = x, y }`,
+		},
+		{
+			"spread: basic",
+			`func f(x int) (any, any) { return g() }; func g() (error, error) { return nil, nil }`,
+			`func _() {
+	var x any
+	x, y := f(0)
+	_, _ = x, y
+}`,
+			`func _() {
+	var x any
+	var y any
+	x, y = g()
+	_, _ = x, y
+}`,
+		},
+		{
+			"spread: free var conflict",
+			`func f(x int) (any, any) { return g(x) }; func g(x int) (int, int) { return x, x }`,
+			`func _() {
+	y := 2
+	{
+		var x any
+		x, y := f(y)
+		_, _ = x, y
+	}
+}`,
+			`func _() {
+	y := 2
+	{
+		var x any
+		x, y := func() (any, any) { return g(y) }()
+		_, _ = x, y
+	}
+}`,
+		},
+		{
+			"convert: basic",
+			`func f(x int) (int32, int8) { return 1, 2 }`,
+			`func _() {
+	var x int32
+  x, y := f(0)
+	_, _ = x, y
+}`,
+			`func _() {
+	var x int32
+	x, y := 1, int8(2)
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: rune and byte",
+			`func f(x int) (rune, byte) { return 0, 0 }`,
+			`func _() {
+	x, y := f(0)
+	_, _ = x, y
+}`,
+			`func _() {
+	x, y := rune(0), byte(0)
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: interface conversions",
 			`func f(x int) (_, _ error) { return nil, nil }`,
-			`func _() { _, _ = f(0) }`,
-			`func _() { _, _ = func() (_, _ error) { return nil, nil }() }`,
+			`func _() {
+  x, y := f(0)
+	_, _ = x, y
+}`,
+			`func _() {
+	x, y := error(nil), error(nil)
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: implicit nil conversions",
+			`func f(x int) (_, _ error) { return nil, nil }`,
+			`func _() { x, y := f(0); _, _ = x, y }`,
+			`func _() { x, y := error(nil), error(nil); _, _ = x, y }`,
+		},
+		{
+			"convert: pruning nil assignments left",
+			`func f(x int) (_, _ error) { return nil, nil }`,
+			`func _() { _, y := f(0); _ = y }`,
+			`func _() { y := error(nil); _ = y }`,
+		},
+		{
+			"convert: pruning nil assignments right",
+			`func f(x int) (_, _ error) { return nil, nil }`,
+			`func _() { x, _ := f(0); _ = x }`,
+			`func _() { x := error(nil); _ = x }`,
+		},
+		{
+			"convert: partial assign",
+			`func f(x int) (_, _ error) { return nil, nil }`,
+			`func _() {
+	var x error
+  x, y := f(0)
+	_, _ = x, y
+}`,
+			`func _() {
+	var x error
+	x, y := nil, error(nil)
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: single assignment left",
+			`func f() int { return 0 }`,
+			`func _() {
+	x, y := f(), "hello"
+	_, _ = x, y
+}`,
+			`func _() {
+	x, y := 0, "hello"
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: single assignment left with conversion",
+			`func f() int32 { return 0 }`,
+			`func _() {
+	x, y := f(), "hello"
+	_, _ = x, y
+}`,
+			`func _() {
+	x, y := int32(0), "hello"
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: single assignment right",
+			`func f() int32 { return 0 }`,
+			`func _() {
+	x, y := "hello", f()
+	_, _ = x, y
+}`,
+			`func _() {
+	x, y := "hello", int32(0)
+	_, _ = x, y
+}`,
+		},
+		{
+			"convert: single assignment middle",
+			`func f() int32 { return 0 }`,
+			`func _() {
+	x, y, z := "hello", f(), 1.56
+	_, _, _ = x, y, z
+}`,
+			`func _() {
+	x, y, z := "hello", int32(0), 1.56
+	_, _, _ = x, y, z
+}`,
 		},
 	})
 }
@@ -754,10 +1044,16 @@ func TestVariadic(t *testing.T) {
 			`func _(slice []any) { println(slice) }`,
 		},
 		{
+			"Undo variadic elimination",
+			`func f(args ...int) []int { return append([]int{1}, args...) }`,
+			`func _(a, b int) { f(a, b) }`,
+			`func _(a, b int) { _ = append([]int{1}, a, b) }`,
+		},
+		{
 			"Variadic elimination (literalization).",
 			`func f(x any, rest ...any) { defer println(x, rest) }`, // defer => literalization
 			`func _() { f(1, 2, 3) }`,
-			`func _() { func() { defer println(any(1), []any{2, 3}) }() }`,
+			`func _() { func() { defer println(1, []any{2, 3}) }() }`,
 		},
 		{
 			"Variadic elimination (reduction).",
@@ -803,7 +1099,7 @@ func TestParameterBindingDecl(t *testing.T) {
 			`func _() { f(g(0), g(1), g(2), g(3)) }`,
 			`func _() {
 	var w, _ any = g(0), g(1)
-	println(w, any(g(2)), g(3))
+	println(w, g(2), g(3))
 }`,
 		},
 		{
@@ -929,6 +1225,60 @@ func TestEmbeddedFields(t *testing.T) {
 	})
 }
 
+func TestSubstitutionGroups(t *testing.T) {
+	runTests(t, []testcase{
+		{
+			// b -> a
+			"Basic",
+			`func f(a, b int) { print(a, b) }`,
+			`func _() { var a int; f(a, a) }`,
+			`func _() { var a int; print(a, a) }`,
+		},
+		{
+			// a <-> b
+			"Cocycle",
+			`func f(a, b int) { print(a, b) }`,
+			`func _() { var a, b int; f(a+b, a+b) }`,
+			`func _() { var a, b int; print(a+b, a+b) }`,
+		},
+		{
+			// a <-> b
+			// a -> c
+			// Don't compute b as substitutable due to bad cycle traversal.
+			"Middle cycle",
+			`func f(a, b, c int) { var d int; print(a, b, c, d) }`,
+			`func _() { var a, b, c, d int; f(a+b+c, a+b, d) }`,
+			`func _() {
+	var a, b, c, d int
+	{
+		var a, b, c int = a + b + c, a + b, d
+		var d int
+		print(a, b, c, d)
+	}
+}`,
+		},
+		{
+			// a -> b
+			// b -> c
+			// b -> d
+			// c
+			//
+			// Only c should be substitutable.
+			"Singleton",
+			`func f(a, b, c, d int) { var e int; print(a, b, c, d, e) }`,
+			`func _() { var a, b, c, d, e int; f(a+b, c+d, c, e) }`,
+			`func _() {
+	var a, b, c, d, e int
+	{
+		var a, b, d int = a + b, c + d, e
+		var e int
+		print(a, b, c, d, e)
+	}
+}`,
+		},
+	})
+}
+
 func TestSubstitutionPreservesArgumentEffectOrder(t *testing.T) {
 	runTests(t, []testcase{
 		{
@@ -1017,7 +1367,7 @@ func TestSubstitutionPreservesArgumentEffectOrder(t *testing.T) {
 		},
 		{
 			// In this example, the set() call is rejected as a substitution
-			// candidate due to a shadowing conflict (x). This must entail that the
+			// candidate due to a shadowing conflict (z). This must entail that the
 			// selection x.y (R) is also rejected, because it is lower numbered.
 			//
 			// Incidentally this program (which panics when executed) illustrates
@@ -1025,12 +1375,13 @@ func TestSubstitutionPreservesArgumentEffectOrder(t *testing.T) {
 			// as x.y are not ordered wrt writes, depending on the compiler.
 			// Changing x.y to identity(x).y forces the ordering and avoids the panic.
 			"Hazards with args already rejected (e.g. due to shadowing) are detected too.",
-			`func f(x, y int) int { return x + y }; func set[T any](ptr *T, old, new T) int { println(old); *ptr = new; return 0; }`,
-			`func _() { x := new(struct{ y int }); f(x.y, set(&x, x, nil)) }`,
+			`func f(x, y int) (z int) { return x + y }; func set[T any](ptr *T, old, new T) int { println(old); *ptr = new; return 0; }`,
+			`func _() { x := new(struct{ y int }); z := x; f(x.y, set(&x, z, nil)) }`,
 			`func _() {
 	x := new(struct{ y int })
+	z := x
 	{
-		var x, y int = x.y, set(&x, x, nil)
+		var x, y int = x.y, set(&x, z, nil)
 		_ = x + y
 	}
 }`,
@@ -1063,7 +1414,13 @@ func TestSubstitutionPreservesArgumentEffectOrder(t *testing.T) {
 			"Defer f() evaluates f() before unknown effects",
 			`func f(int, y any, z int) { defer println(int, y, z) }; func g(int) int`,
 			`func _() { f(g(1), g(2), g(3)) }`,
-			`func _() { func() { defer println(any(g(1)), any(g(2)), g(3)) }() }`,
+			`func _() { func() { defer println(g(1), g(2), g(3)) }() }`,
+		},
+		{
+			"Effects are ignored when IgnoreEffects",
+			`func f(x, y int) { println(y, x) }; func g(int) int`,
+			`func _() { f(g(1), g(2)) }`,
+			`func _() { println(g(2), g(1)) }`,
 		},
 	})
 }
@@ -1185,10 +1542,227 @@ func TestSubstitutionPreservesParameterType(t *testing.T) {
 			`func _() { T(1).g() }`,
 		},
 		{
+			"Implicit reference is made explicit outside of selector",
+			`type T int; func (x *T) f() bool { return x == x.id() }; func (x *T) id() *T { return x }`,
+			`func _() { var t T; _ = t.f() }`,
+			`func _() { var t T; _ = &t == t.id() }`,
+		},
+		{
+			"Implicit parenthesized reference is not made explicit in selector",
+			`type T int; func (x *T) f() bool { return x == (x).id() }; func (x *T) id() *T { return x }`,
+			`func _() { var t T; _ = t.f() }`,
+			`func _() { var t T; _ = &t == (t).id() }`,
+		},
+		{
+			"Implicit dereference is made explicit outside of selector", // TODO(rfindley): avoid unnecessary literalization here
+			`type T int; func (x T) f() bool { return x == x.id() }; func (x T) id() T { return x }`,
+			`func _() { var t *T; _ = t.f() }`,
+			`func _() { var t *T; _ = func() bool { var x T = *t; return x == x.id() }() }`,
+		},
+		{
 			"Check for shadowing error on type used in the conversion.",
 			`func f(x T) { _ = &x == (*T)(nil) }; type T int16`,
 			`func _() { type T bool; f(1) }`,
 			`error: T.*shadowed.*by.*type`,
+		},
+	})
+}
+
+func TestRedundantConversions(t *testing.T) {
+	runTests(t, []testcase{
+		{
+			"Type conversion must be added if the constant is untyped.",
+			`func f(i int32) { print(i) }; func print(x any) {}`,
+			`func _() { f(1)  }`,
+			`func _() { print(int32(1)) }`,
+		},
+		{
+			"Type conversion must not be added if the constant is typed.",
+			`func f(i int32) { print(i) }; func print(x any) {}`,
+			`func _() { f(int32(1))  }`,
+			`func _() { print(int32(1)) }`,
+		},
+		{
+			"No type conversion for argument to interface parameter",
+			`type T int; func f(x any) { g(x) }; func g(any) {}`,
+			`func _() { f(T(1)) }`,
+			`func _() { g(T(1)) }`,
+		},
+		{
+			"No type conversion for parenthesized argument to interface parameter",
+			`type T int; func f(x any) { g((x)) }; func g(any) {}`,
+			`func _() { f(T(1)) }`,
+			`func _() { g((T(1))) }`,
+		},
+		{
+			"Type conversion for argument to type parameter",
+			`type T int; func f(x any) { g(x) }; func g[P any](P) {}`,
+			`func _() { f(T(1)) }`,
+			`func _() { g(any(T(1))) }`,
+		},
+		{
+			"Strip redundant interface conversions",
+			`type T interface{ M() }; func f(x any) { g(x) }; func g[P any](P) {}`,
+			`func _() { f(T(nil)) }`,
+			`func _() { g(any(nil)) }`,
+		},
+		{
+			"No type conversion for argument to variadic interface parameter",
+			`type T int; func f(x ...any) { g(x...) }; func g(...any) {}`,
+			`func _() { f(T(1)) }`,
+			`func _() { g(T(1)) }`,
+		},
+		{
+			"Type conversion for variadic argument",
+			`type T int; func f(x ...any) { g(x...) }; func g(...any) {}`,
+			`func _() { f([]any{T(1)}...) }`,
+			`func _() { g([]any{T(1)}...) }`,
+		},
+		{
+			"Type conversion for argument to interface channel",
+			`type T int; var c chan any; func f(x T) { c <- x }`,
+			`func _() { f(1) }`,
+			`func _() { c <- T(1) }`,
+		},
+		{
+			"No type conversion for argument to concrete channel",
+			`type T int32; var c chan T; func f(x T) { c <- x }`,
+			`func _() { f(1) }`,
+			`func _() { c <- 1 }`,
+		},
+		{
+			"Type conversion for interface map key",
+			`type T int; var m map[any]any; func f(x T) { m[x] = 1 }`,
+			`func _() { f(1) }`,
+			`func _() { m[T(1)] = 1 }`,
+		},
+		{
+			"No type conversion for interface to interface map key",
+			`type T int; var m map[any]any; func f(x any) { m[x] = 1 }`,
+			`func _() { f(T(1)) }`,
+			`func _() { m[T(1)] = 1 }`,
+		},
+		{
+			"No type conversion for concrete map key",
+			`type T int; var m map[T]any; func f(x T) { m[x] = 1 }`,
+			`func _() { f(1) }`,
+			`func _() { m[1] = 1 }`,
+		},
+		{
+			"Type conversion for interface literal key/value",
+			`type T int; type m map[any]any; func f(x, y T) { _ = m{x: y} }`,
+			`func _() { f(1, 2) }`,
+			`func _() { _ = m{T(1): T(2)} }`,
+		},
+		{
+			"No type conversion for concrete literal key/value",
+			`type T int; type m map[T]T; func f(x, y T) { _ = m{x: y} }`,
+			`func _() { f(1, 2) }`,
+			`func _() { _ = m{1: 2} }`,
+		},
+		{
+			"Type conversion for interface literal element",
+			`type T int; type s []any; func f(x T) { _ = s{x} }`,
+			`func _() { f(1) }`,
+			`func _() { _ = s{T(1)} }`,
+		},
+		{
+			"No type conversion for concrete literal element",
+			`type T int; type s []T; func f(x T) { _ = s{x} }`,
+			`func _() { f(1) }`,
+			`func _() { _ = s{1} }`,
+		},
+		{
+			"Type conversion for interface unkeyed struct field",
+			`type T int; type s struct{any}; func f(x T) { _ = s{x} }`,
+			`func _() { f(1) }`,
+			`func _() { _ = s{T(1)} }`,
+		},
+		{
+			"No type conversion for concrete unkeyed struct field",
+			`type T int; type s struct{T}; func f(x T) { _ = s{x} }`,
+			`func _() { f(1) }`,
+			`func _() { _ = s{1} }`,
+		},
+		{
+			"Type conversion for interface field value",
+			`type T int; type S struct{ F any }; func f(x T) { _ = S{F: x} }`,
+			`func _() { f(1) }`,
+			`func _() { _ = S{F: T(1)} }`,
+		},
+		{
+			"No type conversion for concrete field value",
+			`type T int; type S struct{ F T }; func f(x T) { _ = S{F: x} }`,
+			`func _() { f(1) }`,
+			`func _() { _ = S{F: 1} }`,
+		},
+		{
+			"Type conversion for argument to interface channel",
+			`type T int; var c chan any; func f(x any) { c <- x }`,
+			`func _() { f(T(1)) }`,
+			`func _() { c <- T(1) }`,
+		},
+		{
+			"No type conversion for argument to concrete channel",
+			`type T int32; var c chan T; func f(x T) { c <- x }`,
+			`func _() { f(1) }`,
+			`func _() { c <- 1 }`,
+		},
+		{
+			"No type conversion for assignment to an explicit interface type",
+			`type T int; func f(x any) { var y any; y = x; _ = y }`,
+			`func _() { f(T(1)) }`,
+			`func _() {
+	var y any
+	y = T(1)
+	_ = y
+}`,
+		},
+		{
+			"No type conversion for short variable assignment to an explicit interface type",
+			`type T int; func f(e error) { var err any; i, err := 1, e; _, _ = i, err }`,
+			`func _() { f(nil) }`,
+			`func _() {
+	var err any
+	i, err := 1, nil
+	_, _ = i, err
+}`,
+		},
+		{
+			"No type conversion for initializer of an explicit interface type",
+			`type T int; func f(x any) { var y any = x; _ = y }`,
+			`func _() { f(T(1)) }`,
+			`func _() {
+	var y any = T(1)
+	_ = y
+}`,
+		},
+		{
+			"No type conversion for use as a composite literal key",
+			`type T int; func f(x any) { _ = map[any]any{x: 1} }`,
+			`func _() { f(T(1)) }`,
+			`func _() { _ = map[any]any{T(1): 1} }`,
+		},
+		{
+			"No type conversion for use as a composite literal value",
+			`type T int; func f(x any) { _ = []any{x} }`,
+			`func _() { f(T(1)) }`,
+			`func _() { _ = []any{T(1)} }`,
+		},
+		{
+			"No type conversion for use as a composite literal field",
+			`type T int; func f(x any) { _ = struct{ F any }{F: x} }`,
+			`func _() { f(T(1)) }`,
+			`func _() { _ = struct{ F any }{F: T(1)} }`,
+		},
+		{
+			"No type conversion for use in a send statement",
+			`type T int; func f(x any) { var c chan any; c <- x }`,
+			`func _() { f(T(1)) }`,
+			`func _() {
+	var c chan any
+	c <- T(1)
+}`,
 		},
 	})
 }
@@ -1259,7 +1833,7 @@ func runTests(t *testing.T, tests []testcase) {
 			}
 
 			// Analyze callee and inline call.
-			doIt := func() ([]byte, error) {
+			doIt := func() (*inline.Result, error) {
 				callee, err := inline.AnalyzeCallee(t.Logf, fset, pkg, info, decl, []byte(calleeContent))
 				if err != nil {
 					return nil, err
@@ -1278,9 +1852,12 @@ func runTests(t *testing.T, tests []testcase) {
 				}
 				check := checkNoMutation(caller.File)
 				defer check()
-				return inline.Inline(t.Logf, caller, callee)
+				return inline.Inline(caller, callee, &inline.Options{
+					Logf:          t.Logf,
+					IgnoreEffects: strings.Contains(test.descr, "IgnoreEffects"),
+				})
 			}
-			gotContent, err := doIt()
+			res, err := doIt()
 
 			// Want error?
 			if rest := strings.TrimPrefix(test.want, "error: "); rest != test.want {
@@ -1300,6 +1877,8 @@ func runTests(t *testing.T, tests []testcase) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
+			gotContent := res.Content
 
 			// Compute a single-hunk line-based diff.
 			srcLines := strings.Split(callerContent, "\n")
@@ -1439,14 +2018,22 @@ func deepHash(n ast.Node) any {
 				visit(v.Elem())
 			}
 
-		case reflect.Array, reflect.Chan, reflect.Func, reflect.Map, reflect.UnsafePointer:
-			panic(v) // unreachable in AST
+		case reflect.String:
+			writeUint64(uint64(v.Len()))
+			hasher.Write([]byte(v.String()))
 
-		default: // bool, string, number
-			if v.Kind() == reflect.String { // proper framing
-				writeUint64(uint64(v.Len()))
-			}
+		case reflect.Int:
+			writeUint64(uint64(v.Int()))
+
+		case reflect.Uint:
+			writeUint64(uint64(v.Uint()))
+
+		case reflect.Bool, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			// Bools and fixed width numbers can be handled by binary.Write.
 			binary.Write(hasher, le, v.Interface())
+
+		default: // reflect.Array, reflect.Chan, reflect.Func, reflect.Map, reflect.UnsafePointer, reflect.Uintptr
+			panic(v) // unreachable in AST
 		}
 	}
 	visit(reflect.ValueOf(n))
@@ -1454,4 +2041,24 @@ func deepHash(n ast.Node) any {
 	var hash [sha256.Size]byte
 	hasher.Sum(hash[:0])
 	return hash
+}
+
+func TestDeepHash(t *testing.T) {
+	// This test reproduces a bug in DeepHash that was encountered during work on
+	// the inliner.
+	//
+	// TODO(rfindley): consider replacing this with a fuzz test.
+	id := &ast.Ident{
+		NamePos: 2,
+		Name:    "t",
+	}
+	c := &ast.CallExpr{
+		Fun: id,
+	}
+	h1 := deepHash(c)
+	id.NamePos = 1
+	h2 := deepHash(c)
+	if h1 == h2 {
+		t.Fatal("bad")
+	}
 }

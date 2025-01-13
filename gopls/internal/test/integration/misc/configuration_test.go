@@ -15,11 +15,6 @@ import (
 // Test that enabling and disabling produces the expected results of showing
 // and hiding staticcheck analysis results.
 func TestChangeConfiguration(t *testing.T) {
-	// Staticcheck only supports Go versions >= 1.20.
-	// Note: keep this in sync with TestStaticcheckWarning. Below this version we
-	// should get an error when setting staticcheck configuration.
-	testenv.NeedsGo1Point(t, 20)
-
 	const files = `
 -- go.mod --
 module mod.com
@@ -39,13 +34,80 @@ var FooErr = errors.New("foo")
 			NoDiagnostics(ForFile("a/a.go")),
 		)
 		cfg := env.Editor.Config()
-		cfg.Settings = map[string]interface{}{
+		cfg.Settings = map[string]any{
 			"staticcheck": true,
 		}
 		env.ChangeConfiguration(cfg)
 		env.AfterChange(
 			Diagnostics(env.AtRegexp("a/a.go", "var (FooErr)")),
 		)
+	})
+}
+
+func TestIdenticalConfiguration(t *testing.T) {
+	// This test checks that changing configuration does not cause views to be
+	// recreated if there is no configuration change.
+	const files = `
+-- a.go --
+package p
+
+func _() {
+	var x *int
+	y := *x
+	_ = y
+}
+`
+	Run(t, files, func(t *testing.T, env *Env) {
+		// Sanity check: before disabling the nilness analyzer, we should have a
+		// diagnostic for the nil dereference.
+		env.OpenFile("a.go")
+		env.AfterChange(
+			Diagnostics(
+				ForFile("a.go"),
+				WithMessage("nil dereference"),
+			),
+		)
+
+		// Collect the view ID before changing configuration.
+		viewID := func() string {
+			t.Helper()
+			views := env.Views()
+			if len(views) != 1 {
+				t.Fatalf("got %d views, want 1", len(views))
+			}
+			return views[0].ID
+		}
+		before := viewID()
+
+		// Now disable the nilness analyzer.
+		cfg := env.Editor.Config()
+		cfg.Settings = map[string]any{
+			"analyses": map[string]any{
+				"nilness": false,
+			},
+		}
+
+		// This should cause the diagnostic to disappear...
+		env.ChangeConfiguration(cfg)
+		env.AfterChange(
+			NoDiagnostics(),
+		)
+		// ...and we should be on the second view.
+		after := viewID()
+		if after == before {
+			t.Errorf("after configuration change, got view %q (same as before), want new view", after)
+		}
+
+		// Now change configuration again, this time with the same configuration as
+		// before. We should still have no diagnostics...
+		env.ChangeConfiguration(cfg)
+		env.AfterChange(
+			NoDiagnostics(),
+		)
+		// ...and we should still be on the second view.
+		if got := viewID(); got != after {
+			t.Errorf("after second configuration change, got view %q, want %q", got, after)
+		}
 	})
 }
 
@@ -97,8 +159,6 @@ type B struct {
 //
 // Gopls should not get confused about buffer content when recreating the view.
 func TestMajorOptionsChange(t *testing.T) {
-	testenv.NeedsGo1Point(t, 20) // needs staticcheck
-
 	const files = `
 -- go.mod --
 module mod.com
@@ -172,6 +232,7 @@ func TestDeprecatedSettings(t *testing.T) {
 			"experimentalWorkspaceModule":    true,
 			"tempModfile":                    true,
 			"allowModfileModifications":      true,
+			"allowImplicitNetworkAccess":     true,
 		},
 	).Run(t, "", func(t *testing.T, env *Env) {
 		env.OnceMet(
@@ -181,6 +242,7 @@ func TestDeprecatedSettings(t *testing.T) {
 			ShownMessage("experimentalWatchedFileDelay"),
 			ShownMessage("tempModfile"),
 			ShownMessage("allowModfileModifications"),
+			ShownMessage("allowImplicitNetworkAccess"),
 		)
 	})
 }

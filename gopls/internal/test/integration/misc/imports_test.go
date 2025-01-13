@@ -6,6 +6,7 @@ package misc
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -65,20 +66,65 @@ package main
 import "fmt"
 
 //this comment is necessary for failure
-func a() {
+func _() {
 	fmt.Println("hello")
 }
 `
 	Run(t, stuff, func(t *testing.T, env *Env) {
 		env.OpenFile("a.go")
 		was := env.BufferText("a.go")
-		env.Await(NoDiagnostics())
+		env.AfterChange(NoDiagnostics())
 		env.OrganizeImports("a.go")
 		is := env.BufferText("a.go")
 		if diff := compare.Text(was, is); diff != "" {
 			t.Errorf("unexpected diff after organizeImports:\n%s", diff)
 		}
 	})
+}
+
+func TestIssue66407(t *testing.T) {
+	const files = `
+-- go.mod --
+module foo
+go 1.21
+-- a.go --
+package foo
+
+func f(x float64) float64 {
+	return x +  rand.Float64()
+}
+-- b.go --
+package foo
+
+func _() {
+	_ = rand.Int63()
+}
+`
+	WithOptions(Modes(Default)).
+		Run(t, files, func(t *testing.T, env *Env) {
+			env.OpenFile("a.go")
+			was := env.BufferText("a.go")
+			env.OrganizeImports("a.go")
+			is := env.BufferText("a.go")
+			// expect complaint that module is before 1.22
+			env.AfterChange(Diagnostics(ForFile("a.go")))
+			diff := compare.Text(was, is)
+			// check that it found the 'right' rand
+			if !strings.Contains(diff, `import "math/rand/v2"`) {
+				t.Errorf("expected rand/v2, got %q", diff)
+			}
+			env.OpenFile("b.go")
+			was = env.BufferText("b.go")
+			env.OrganizeImports("b.go")
+			// a.go still has its module problem but b.go is fine
+			env.AfterChange(Diagnostics(ForFile("a.go")),
+				NoDiagnostics(ForFile("b.go")))
+			is = env.BufferText("b.go")
+			diff = compare.Text(was, is)
+			if !strings.Contains(diff, `import "math/rand"`) {
+				t.Errorf("expected math/rand, got %q", diff)
+			}
+		})
 }
 
 func TestVim1(t *testing.T) {
@@ -104,7 +150,7 @@ func main() {
 		env.OrganizeImports("main.go")
 
 		// Assert no quick fixes.
-		for _, act := range env.CodeAction("main.go", nil) {
+		for _, act := range env.CodeActionForFile("main.go", nil) {
 			if act.Kind == protocol.QuickFix {
 				t.Errorf("unexpected quick fix action: %#v", act)
 			}
@@ -142,7 +188,7 @@ func main() {
 		env.OrganizeImports("main.go")
 
 		// Assert no quick fixes.
-		for _, act := range env.CodeAction("main.go", nil) {
+		for _, act := range env.CodeActionForFile("main.go", nil) {
 			if act.Kind == protocol.QuickFix {
 				t.Errorf("unexpected quick-fix action: %#v", act)
 			}
@@ -150,8 +196,7 @@ func main() {
 	})
 }
 
-func TestGOMODCACHE(t *testing.T) {
-	const proxy = `
+const exampleProxy = `
 -- example.com@v1.2.3/go.mod --
 module example.com
 
@@ -165,6 +210,8 @@ package y
 
 const Y = 2
 `
+
+func TestGOMODCACHE(t *testing.T) {
 	const files = `
 -- go.mod --
 module mod.com
@@ -172,9 +219,6 @@ module mod.com
 go 1.12
 
 require example.com v1.2.3
--- go.sum --
-example.com v1.2.3 h1:6vTQqzX+pnwngZF1+5gcO3ZEWmix1jJ/h+pWS8wUxK0=
-example.com v1.2.3/go.mod h1:Y2Rc5rVWjWur0h3pd9aEvK5Pof8YKDANh9gHA2Maujo=
 -- main.go --
 package main
 
@@ -182,14 +226,13 @@ import "example.com/x"
 
 var _, _ = x.X, y.Y
 `
-	modcache, err := os.MkdirTemp("", "TestGOMODCACHE-modcache")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(modcache)
+	modcache := t.TempDir()
+	defer cleanModCache(t, modcache) // see doc comment of cleanModCache
+
 	WithOptions(
 		EnvVars{"GOMODCACHE": modcache},
-		ProxyFiles(proxy),
+		ProxyFiles(exampleProxy),
+		WriteGoSum("."),
 	).Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		env.AfterChange(Diagnostics(env.AtRegexp("main.go", `y.Y`)))
@@ -201,6 +244,58 @@ var _, _ = x.X, y.Y
 			t.Errorf("found module dependency outside of GOMODCACHE: got %v, wanted subdir of %v", path, filepath.ToSlash(modcache))
 		}
 	})
+}
+
+func TestRelativeReplace(t *testing.T) {
+	const files = `
+-- go.mod --
+module mod.com/a
+
+go 1.20
+
+require (
+	example.com   v1.2.3
+)
+
+replace example.com/b => ../b
+-- main.go --
+package main
+
+import "example.com/x"
+
+var _, _ = x.X, y.Y
+`
+	modcache := t.TempDir()
+	base := filepath.Base(modcache)
+	defer cleanModCache(t, modcache) // see doc comment of cleanModCache
+
+	// Construct a very unclean module cache whose length exceeds the length of
+	// the clean directory path, to reproduce the crash in golang/go#67156
+	const sep = string(filepath.Separator)
+	modcache += strings.Repeat(sep+".."+sep+base, 10)
+
+	WithOptions(
+		EnvVars{"GOMODCACHE": modcache},
+		ProxyFiles(exampleProxy),
+		WriteGoSum("."),
+	).Run(t, files, func(t *testing.T, env *Env) {
+		env.OpenFile("main.go")
+		env.AfterChange(Diagnostics(env.AtRegexp("main.go", `y.Y`)))
+		env.SaveBuffer("main.go")
+		env.AfterChange(NoDiagnostics(ForFile("main.go")))
+	})
+}
+
+// TODO(rfindley): this is only necessary as the module cache cleaning of the
+// sandbox does not respect GOMODCACHE set via EnvVars. We should fix this, but
+// that is probably part of a larger refactoring of the sandbox that I'm not
+// inclined to undertake.
+func cleanModCache(t *testing.T, modcache string) {
+	cmd := exec.Command("go", "clean", "-modcache")
+	cmd.Env = append(os.Environ(), "GOMODCACHE="+modcache, "GOTOOLCHAIN=local")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Errorf("cleaning modcache: %v\noutput:\n%s", err, string(output))
+	}
 }
 
 // Tests golang/go#40685.

@@ -3,6 +3,11 @@ unexported interface methods in non-workspace packages.
 
 Previously, we would fail to produce a diagnostic because we trimmed the AST.
 See golang/go#56943.
+-- settings.json --
+{
+	"pullDiagnostics": true
+}
+
 -- main.go --
 package main
 
@@ -12,7 +17,7 @@ import (
 )
 
 func main() {
-	var a int               //@diag(re"(a) int", re"a.*declared.*not used")
+	var a int               //@diag(re"(a) int", re"declared.*not used")
 	var _ ast.Expr = node{} //@diag("node{}", re"missing.*exprNode")
 }
 

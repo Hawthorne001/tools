@@ -23,7 +23,8 @@ import (
 	"text/scanner"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/internal/checker"
+	"golang.org/x/tools/go/analysis/checker"
+	"golang.org/x/tools/go/analysis/internal"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/testenv"
@@ -114,9 +115,9 @@ type Testing interface {
 // into nonconflicting parts.
 //
 // Conflicts of the second kind can be avoided by giving the
-// alternative fixes different names (SuggestedFix.Message) and using
-// a multi-section .txtar file with a named section for each
-// alternative fix.
+// alternative fixes different names (SuggestedFix.Message) and
+// defining the .golden file as a multi-section txtar file with a
+// named section for each alternative fix, as shown above.
 //
 // Analyzers that compute fixes from a textual diff of the
 // before/after file contents (instead of directly from syntax tree
@@ -126,8 +127,18 @@ type Testing interface {
 // sufficient separation of the statements in the test input so that
 // the computed diffs do not overlap. If that fails, break the test
 // into smaller parts.
+//
+// TODO(adonovan): the behavior of RunWithSuggestedFixes as documented
+// above is impractical for tests that report multiple diagnostics and
+// offer multiple alternative fixes for the same diagnostic, and it is
+// inconsistent with the interpretation of multiple diagnostics
+// described at Diagnostic.SuggestedFixes.
+// We need to rethink the analyzer testing API to better support such
+// cases. In the meantime, users of RunWithSuggestedFixes testing
+// analyzers that offer alternative fixes are advised to put each fix
+// in a separate .go file in the testdata.
 func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Result {
-	r := Run(t, dir, a, patterns...)
+	results := Run(t, dir, a, patterns...)
 
 	// If the immediate caller of RunWithSuggestedFixes is in
 	// x/tools, we apply stricter checks as required by gopls.
@@ -152,7 +163,9 @@ func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns
 	// Validating the results separately means as long as the two analyses
 	// don't produce conflicting suggestions for a single file, everything
 	// should match up.
-	for _, act := range r {
+	for _, result := range results {
+		act := result.Action
+
 		// file -> message -> edits
 		fileEdits := make(map[*token.File]map[string][]diff.Edit)
 		fileContents := make(map[*token.File][]byte)
@@ -175,14 +188,23 @@ func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns
 					if start > end {
 						t.Errorf(
 							"diagnostic for analysis %v contains Suggested Fix with malformed edit: pos (%v) > end (%v)",
-							act.Pass.Analyzer.Name, start, end)
+							act.Analyzer.Name, start, end)
 						continue
 					}
-					file, endfile := act.Pass.Fset.File(start), act.Pass.Fset.File(end)
-					if file == nil || endfile == nil || file != endfile {
+					file := act.Package.Fset.File(start)
+					if file == nil {
+						t.Errorf("diagnostic for analysis %v contains Suggested Fix with malformed start position %v", act.Analyzer.Name, start)
+						continue
+					}
+					endFile := act.Package.Fset.File(end)
+					if endFile == nil {
+						t.Errorf("diagnostic for analysis %v contains Suggested Fix with malformed end position %v", act.Analyzer.Name, end)
+						continue
+					}
+					if file != endFile {
 						t.Errorf(
 							"diagnostic for analysis %v contains Suggested Fix with malformed spanning files %v and %v",
-							act.Pass.Analyzer.Name, file.Name(), endfile.Name())
+							act.Analyzer.Name, file.Name(), endFile.Name())
 						continue
 					}
 					if _, ok := fileContents[file]; !ok {
@@ -265,7 +287,7 @@ func RunWithSuggestedFixes(t Testing, dir string, a *analysis.Analyzer, patterns
 			}
 		}
 	}
-	return r
+	return results
 }
 
 // applyDiffsAndCompare applies edits to src and compares the results against
@@ -339,41 +361,98 @@ func Run(t Testing, dir string, a *analysis.Analyzer, patterns ...string) []*Res
 		testenv.NeedsGoPackages(t)
 	}
 
-	pkgs, err := loadPackages(a, dir, patterns...)
+	pkgs, err := loadPackages(dir, patterns...)
 	if err != nil {
 		t.Errorf("loading %s: %v", patterns, err)
 		return nil
 	}
 
-	if err := analysis.Validate([]*analysis.Analyzer{a}); err != nil {
-		t.Errorf("Validate: %v", err)
+	// Print parse and type errors to the test log.
+	// (Do not print them to stderr, which would pollute
+	// the log in cases where the tests pass.)
+	if t, ok := t.(testing.TB); ok && !a.RunDespiteErrors {
+		packages.Visit(pkgs, nil, func(pkg *packages.Package) {
+			for _, err := range pkg.Errors {
+				t.Log(err)
+			}
+		})
+	}
+
+	res, err := checker.Analyze([]*analysis.Analyzer{a}, pkgs, nil)
+	if err != nil {
+		t.Errorf("Analyze: %v", err)
 		return nil
 	}
 
-	results := checker.TestAnalyzer(a, pkgs)
-	for _, result := range results {
-		if result.Err != nil {
-			t.Errorf("error analyzing %s: %v", result.Pass, result.Err)
+	var results []*Result
+	for _, act := range res.Roots {
+		if act.Err != nil {
+			t.Errorf("error analyzing %s: %v", act, act.Err)
 		} else {
-			check(t, dir, result.Pass, result.Diagnostics, result.Facts)
+			check(t, dir, act)
 		}
+
+		// Compute legacy map of facts relating to this package.
+		facts := make(map[types.Object][]analysis.Fact)
+		for _, objFact := range act.AllObjectFacts() {
+			if obj := objFact.Object; obj.Pkg() == act.Package.Types {
+				facts[obj] = append(facts[obj], objFact.Fact)
+			}
+		}
+		for _, pkgFact := range act.AllPackageFacts() {
+			if pkgFact.Package == act.Package.Types {
+				facts[nil] = append(facts[nil], pkgFact.Fact)
+			}
+		}
+
+		// Construct the legacy result.
+		results = append(results, &Result{
+			Pass:        internal.Pass(act),
+			Diagnostics: act.Diagnostics,
+			Facts:       facts,
+			Result:      act.Result,
+			Err:         act.Err,
+			Action:      act,
+		})
 	}
 	return results
 }
 
 // A Result holds the result of applying an analyzer to a package.
-type Result = checker.TestAnalyzerResult
+//
+// Facts contains only facts associated with the package and its objects.
+//
+// This internal type was inadvertently and regrettably exposed
+// through a public type alias. It is essentially redundant with
+// [checker.Action], but must be retained for compatibility. Clients may
+// access the public fields of the Pass but must not invoke any of
+// its "verbs", since the pass is already complete.
+type Result struct {
+	Action *checker.Action
+
+	// legacy fields
+	Facts       map[types.Object][]analysis.Fact // nil key => package fact
+	Pass        *analysis.Pass
+	Diagnostics []analysis.Diagnostic // see Action.Diagnostics
+	Result      any                   // see Action.Result
+	Err         error                 // see Action.Err
+}
 
 // loadPackages uses go/packages to load a specified packages (from source, with
 // dependencies) from dir, which is the root of a GOPATH-style project tree.
 // loadPackages returns an error if any package had an error, or the pattern
 // matched no packages.
-func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*packages.Package, error) {
-	env := []string{"GOPATH=" + dir, "GO111MODULE=off"} // GOPATH mode
+func loadPackages(dir string, patterns ...string) ([]*packages.Package, error) {
+	env := []string{"GOPATH=" + dir, "GO111MODULE=off", "GOWORK=off"} // GOPATH mode
 
 	// Undocumented module mode. Will be replaced by something better.
 	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-		env = []string{"GO111MODULE=on", "GOPROXY=off"} // module mode
+		gowork := filepath.Join(dir, "go.work")
+		if _, err := os.Stat(gowork); err != nil {
+			gowork = "off"
+		}
+
+		env = []string{"GO111MODULE=on", "GOPROXY=off", "GOWORK=" + gowork} // module mode
 	}
 
 	// packages.Load loads the real standard library, not a minimal
@@ -397,12 +476,13 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 		return nil, err
 	}
 
-	// Do NOT print errors if the analyzer will continue running.
-	// It is incredibly confusing for tests to be printing to stderr
-	// willy-nilly instead of their test logs, especially when the
-	// errors are expected and are going to be fixed.
-	if !a.RunDespiteErrors {
-		packages.PrintErrors(pkgs)
+	// If any named package couldn't be loaded at all
+	// (e.g. the Name field is unset), fail fast.
+	for _, pkg := range pkgs {
+		if pkg.Name == "" {
+			return nil, fmt.Errorf("failed to load %q: Errors=%v",
+				pkg.PkgPath, pkg.Errors)
+		}
 	}
 
 	if len(pkgs) == 0 {
@@ -415,7 +495,7 @@ func loadPackages(a *analysis.Analyzer, dir string, patterns ...string) ([]*pack
 // been run, and verifies that all reported diagnostics and facts match
 // specified by the contents of "// want ..." comments in the package's
 // source files, which must have been parsed with comments enabled.
-func check(t Testing, gopath string, pass *analysis.Pass, diagnostics []analysis.Diagnostic, facts map[types.Object][]analysis.Fact) {
+func check(t Testing, gopath string, act *checker.Action) {
 	type key struct {
 		file string
 		line int
@@ -442,7 +522,7 @@ func check(t Testing, gopath string, pass *analysis.Pass, diagnostics []analysis
 	}
 
 	// Extract 'want' comments from parsed Go files.
-	for _, f := range pass.Files {
+	for _, f := range act.Package.Syntax {
 		for _, cgroup := range f.Comments {
 			for _, c := range cgroup.List {
 
@@ -465,7 +545,7 @@ func check(t Testing, gopath string, pass *analysis.Pass, diagnostics []analysis
 				// once outside the loop, but it's
 				// incorrect because it can change due
 				// to //line directives.
-				posn := pass.Fset.Position(c.Pos())
+				posn := act.Package.Fset.Position(c.Pos())
 				filename := sanitize(gopath, posn.Filename)
 				processComment(filename, posn.Line, text)
 			}
@@ -474,7 +554,17 @@ func check(t Testing, gopath string, pass *analysis.Pass, diagnostics []analysis
 
 	// Extract 'want' comments from non-Go files.
 	// TODO(adonovan): we may need to handle //line directives.
-	for _, filename := range pass.OtherFiles {
+	files := act.Package.OtherFiles
+
+	// Hack: these two analyzers need to extract expectations from
+	// all configurations, so include the files are are usually
+	// ignored. (This was previously a hack in the respective
+	// analyzers' tests.)
+	if act.Analyzer.Name == "buildtag" || act.Analyzer.Name == "directive" {
+		files = append(files[:len(files):len(files)], act.Package.IgnoredFiles...)
+	}
+
+	for _, filename := range files {
 		data, err := os.ReadFile(filename)
 		if err != nil {
 			t.Errorf("can't read '// want' comments from %s: %v", filename, err)
@@ -527,45 +617,38 @@ func check(t Testing, gopath string, pass *analysis.Pass, diagnostics []analysis
 	}
 
 	// Check the diagnostics match expectations.
-	for _, f := range diagnostics {
+	for _, f := range act.Diagnostics {
 		// TODO(matloob): Support ranges in analysistest.
-		posn := pass.Fset.Position(f.Pos)
+		posn := act.Package.Fset.Position(f.Pos)
 		checkMessage(posn, "diagnostic", "", f.Message)
 	}
 
 	// Check the facts match expectations.
-	// Report errors in lexical order for determinism.
+	// We check only facts relating to the current package.
+	//
+	// We report errors in lexical order for determinism.
 	// (It's only deterministic within each file, not across files,
 	// because go/packages does not guarantee file.Pos is ascending
 	// across the files of a single compilation unit.)
-	var objects []types.Object
-	for obj := range facts {
-		objects = append(objects, obj)
-	}
-	sort.Slice(objects, func(i, j int) bool {
-		// Package facts compare less than object facts.
-		ip, jp := objects[i] == nil, objects[j] == nil // whether i, j is a package fact
-		if ip != jp {
-			return ip && !jp
-		}
-		return objects[i].Pos() < objects[j].Pos()
-	})
-	for _, obj := range objects {
-		var posn token.Position
-		var name string
-		if obj != nil {
-			// Object facts are reported on the declaring line.
-			name = obj.Name()
-			posn = pass.Fset.Position(obj.Pos())
-		} else {
-			// Package facts are reported at the start of the file.
-			name = "package"
-			posn = pass.Fset.Position(pass.Files[0].Pos())
-			posn.Line = 1
-		}
 
-		for _, fact := range facts[obj] {
-			checkMessage(posn, "fact", name, fmt.Sprint(fact))
+	// package facts: reported at start of first file
+	for _, pkgFact := range act.AllPackageFacts() {
+		if pkgFact.Package == act.Package.Types {
+			posn := act.Package.Fset.Position(act.Package.Syntax[0].Pos())
+			posn.Line, posn.Column = 1, 1
+			checkMessage(posn, "fact", "package", fmt.Sprint(pkgFact))
+		}
+	}
+
+	// object facts: reported at line of object declaration
+	objFacts := act.AllObjectFacts()
+	sort.Slice(objFacts, func(i, j int) bool {
+		return objFacts[i].Object.Pos() < objFacts[j].Object.Pos()
+	})
+	for _, objFact := range objFacts {
+		if obj := objFact.Object; obj.Pkg() == act.Package.Types {
+			posn := act.Package.Fset.Position(obj.Pos())
+			checkMessage(posn, "fact", obj.Name(), fmt.Sprint(objFact.Fact))
 		}
 	}
 

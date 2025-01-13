@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -72,7 +73,7 @@ func writeFileData(path string, content []byte, rel RelativeTo) error {
 
 // isWindowsErrLockViolation reports whether err is ERROR_LOCK_VIOLATION
 // on Windows.
-var isWindowsErrLockViolation = func(err error) bool { return false }
+var isWindowsErrLockViolation = func(error) bool { return false }
 
 // Workdir is a temporary working directory for tests. It exposes file
 // operations in terms of relative paths, and fakes file watching by triggering
@@ -147,6 +148,11 @@ func (w *Workdir) URI(path string) protocol.DocumentURI {
 // if the uri is outside of the workdir).
 func (w *Workdir) URIToPath(uri protocol.DocumentURI) string {
 	return w.RelPath(uri.Path())
+}
+
+// EntireFile returns the entire extent of the file named by the workdir-relative path.
+func (w *Workdir) EntireFile(path string) protocol.Location {
+	return protocol.Location{URI: w.URI(path)}
 }
 
 // ReadFile reads a text file specified by a workdir-relative path.
@@ -328,8 +334,7 @@ func (w *Workdir) CheckForFileChanges(ctx context.Context) error {
 		return nil
 	}
 	w.watcherMu.Lock()
-	watchers := make([]func(context.Context, []protocol.FileEvent), len(w.watchers))
-	copy(watchers, w.watchers)
+	watchers := slices.Clone(w.watchers)
 	w.watcherMu.Unlock()
 	for _, w := range watchers {
 		w(ctx, evts)

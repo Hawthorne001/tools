@@ -40,7 +40,6 @@ import (
 
 	"golang.org/x/tools/gopls/internal/cmd"
 	"golang.org/x/tools/gopls/internal/debug"
-	"golang.org/x/tools/gopls/internal/hooks"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/version"
@@ -49,7 +48,7 @@ import (
 	"golang.org/x/tools/txtar"
 )
 
-// TestVersion tests the 'version' subcommand (../info.go).
+// TestVersion tests the 'version' subcommand (info.go).
 func TestVersion(t *testing.T) {
 	t.Parallel()
 
@@ -85,7 +84,7 @@ func TestVersion(t *testing.T) {
 	}
 }
 
-// TestCheck tests the 'check' subcommand (../check.go).
+// TestCheck tests the 'check' subcommand (check.go).
 func TestCheck(t *testing.T) {
 	t.Parallel()
 
@@ -103,6 +102,12 @@ var _ = fmt.Sprintf("%s", 123)
 package a
 import "fmt"
 var _ = fmt.Sprintf("%d", "123")
+-- c/c.go --
+package c
+var C int
+-- c/c2.go --
+package c
+var C int
 `)
 
 	// no files
@@ -128,9 +133,17 @@ var _ = fmt.Sprintf("%d", "123")
 		res.checkStdout(`a.go:.* fmt.Sprintf format %s has arg 123 of wrong type int`)
 		res.checkStdout(`b.go:.* fmt.Sprintf format %d has arg "123" of wrong type string`)
 	}
+
+	// diagnostic with related information spanning files
+	{
+		res := gopls(t, tree, "check", "./c/c2.go")
+		res.checkExit(true)
+		res.checkStdout(`c2.go:2:5-6: C redeclared in this block`)
+		res.checkStdout(`c.go:2:5-6: - other declaration of C`)
+	}
 }
 
-// TestCallHierarchy tests the 'call_hierarchy' subcommand (../call_hierarchy.go).
+// TestCallHierarchy tests the 'call_hierarchy' subcommand (call_hierarchy.go).
 func TestCallHierarchy(t *testing.T) {
 	t.Parallel()
 
@@ -173,7 +186,7 @@ func h() {
 	}
 }
 
-// TestCodeLens tests the 'codelens' subcommand (../codelens.go).
+// TestCodeLens tests the 'codelens' subcommand (codelens.go).
 func TestCodeLens(t *testing.T) {
 	t.Parallel()
 
@@ -211,7 +224,7 @@ func TestFail(t *testing.T) { t.Fatal("fail") }
 	}
 	// run the passing test
 	{
-		res := gopls(t, tree, "codelens", "-exec", "./a/a_test.go:3", "run test")
+		res := gopls(t, tree, "-v", "codelens", "-exec", "./a/a_test.go:3", "run test")
 		res.checkExit(true)
 		res.checkStderr(`PASS: TestPass`)         // from go test
 		res.checkStderr("Info: all tests passed") // from gopls.test
@@ -225,7 +238,7 @@ func TestFail(t *testing.T) { t.Fatal("fail") }
 	}
 }
 
-// TestDefinition tests the 'definition' subcommand (../definition.go).
+// TestDefinition tests the 'definition' subcommand (definition.go).
 func TestDefinition(t *testing.T) {
 	t.Parallel()
 
@@ -276,7 +289,7 @@ func g() {
 	}
 }
 
-// TestExecute tests the 'execute' subcommand (../execute.go).
+// TestExecute tests the 'execute' subcommand (execute.go).
 func TestExecute(t *testing.T) {
 	t.Parallel()
 
@@ -350,7 +363,7 @@ func TestHello(t *testing.T) {
 	}
 }
 
-// TestFoldingRanges tests the 'folding_ranges' subcommand (../folding_range.go).
+// TestFoldingRanges tests the 'folding_ranges' subcommand (folding_range.go).
 func TestFoldingRanges(t *testing.T) {
 	t.Parallel()
 
@@ -380,7 +393,7 @@ func f(x int) {
 	}
 }
 
-// TestFormat tests the 'format' subcommand (../format.go).
+// TestFormat tests the 'format' subcommand (format.go).
 func TestFormat(t *testing.T) {
 	t.Parallel()
 
@@ -440,7 +453,7 @@ func f() {}
 	}
 }
 
-// TestHighlight tests the 'highlight' subcommand (../highlight.go).
+// TestHighlight tests the 'highlight' subcommand (highlight.go).
 func TestHighlight(t *testing.T) {
 	t.Parallel()
 
@@ -469,7 +482,7 @@ func f() {
 	}
 }
 
-// TestImplementations tests the 'implementation' subcommand (../implementation.go).
+// TestImplementations tests the 'implementation' subcommand (implementation.go).
 func TestImplementations(t *testing.T) {
 	t.Parallel()
 
@@ -498,7 +511,7 @@ func (T) String() string { return "" }
 	}
 }
 
-// TestImports tests the 'imports' subcommand (../imports.go).
+// TestImports tests the 'imports' subcommand (imports.go).
 func TestImports(t *testing.T) {
 	t.Parallel()
 
@@ -547,7 +560,7 @@ func _() {
 	}
 }
 
-// TestLinks tests the 'links' subcommand (../links.go).
+// TestLinks tests the 'links' subcommand (links.go).
 func TestLinks(t *testing.T) {
 	t.Parallel()
 
@@ -592,7 +605,7 @@ func f() {}
 	}
 }
 
-// TestReferences tests the 'references' subcommand (../references.go).
+// TestReferences tests the 'references' subcommand (references.go).
 func TestReferences(t *testing.T) {
 	t.Parallel()
 
@@ -630,7 +643,7 @@ func g() {
 	}
 }
 
-// TestSignature tests the 'signature' subcommand (../signature.go).
+// TestSignature tests the 'signature' subcommand (signature.go).
 func TestSignature(t *testing.T) {
 	t.Parallel()
 
@@ -661,7 +674,7 @@ func f() {
 	}
 }
 
-// TestPrepareRename tests the 'prepare_rename' subcommand (../prepare_rename.go).
+// TestPrepareRename tests the 'prepare_rename' subcommand (prepare_rename.go).
 func TestPrepareRename(t *testing.T) {
 	t.Parallel()
 
@@ -700,7 +713,7 @@ func oldname() {}
 	}
 }
 
-// TestRename tests the 'rename' subcommand (../rename.go).
+// TestRename tests the 'rename' subcommand (rename.go).
 func TestRename(t *testing.T) {
 	t.Parallel()
 
@@ -746,7 +759,7 @@ func oldname() {}
 	}
 }
 
-// TestSymbols tests the 'symbols' subcommand (../symbols.go).
+// TestSymbols tests the 'symbols' subcommand (symbols.go).
 func TestSymbols(t *testing.T) {
 	t.Parallel()
 
@@ -777,7 +790,7 @@ const c = 0
 	}
 }
 
-// TestSemtok tests the 'semtok' subcommand (../semantictokens.go).
+// TestSemtok tests the 'semtok' subcommand (semantictokens.go).
 func TestSemtok(t *testing.T) {
 	t.Parallel()
 
@@ -805,9 +818,9 @@ const c = 0
 		got := res.stdout
 		want := `
 /*⇒7,keyword,[]*/package /*⇒1,namespace,[]*/a
-/*⇒4,keyword,[]*/func /*⇒1,function,[definition]*/f()
-/*⇒3,keyword,[]*/var /*⇒1,variable,[definition]*/v /*⇒3,type,[defaultLibrary]*/int
-/*⇒5,keyword,[]*/const /*⇒1,variable,[definition readonly]*/c = /*⇒1,number,[]*/0
+/*⇒4,keyword,[]*/func /*⇒1,function,[definition signature]*/f()
+/*⇒3,keyword,[]*/var /*⇒1,variable,[definition number]*/v /*⇒3,type,[defaultLibrary number]*/int
+/*⇒5,keyword,[]*/const /*⇒1,variable,[definition readonly number]*/c = /*⇒1,number,[]*/0
 `[1:]
 		if got != want {
 			t.Errorf("semtok: got <<%s>>, want <<%s>>", got, want)
@@ -928,8 +941,8 @@ package foo
 	}
 }
 
-// TestFix tests the 'fix' subcommand (../suggested_fix.go).
-func TestFix(t *testing.T) {
+// TestCodeAction tests the 'codeaction' subcommand (codeaction.go).
+func TestCodeAction(t *testing.T) {
 	t.Parallel()
 
 	tree := writeTree(t, `
@@ -951,29 +964,62 @@ type C struct{}
 
 	// no arguments
 	{
-		res := gopls(t, tree, "fix")
+		res := gopls(t, tree, "codeaction")
 		res.checkExit(false)
 		res.checkStderr("expects at least 1 argument")
 	}
-	// success with default kinds, {quickfix}.
-	// -a is always required because no fix is currently "preferred" (!)
+	// list code actions in file
 	{
-		res := gopls(t, tree, "fix", "-a", "a.go")
+		res := gopls(t, tree, "codeaction", "a.go")
+		res.checkExit(true)
+		res.checkStdout(`edit	"Fill in return values" \[quickfix\]`)
+		res.checkStdout(`command	"Browse documentation for package a" \[source.doc\]`)
+	}
+	// list code actions in file, filtering by title
+	{
+		res := gopls(t, tree, "codeaction", "-title=Browse.*doc", "a.go")
 		res.checkExit(true)
 		got := res.stdout
-		want := `
-package a
-type T int
-func f() (int, string) { return 0, "" }
-
-`[1:]
+		want := `command	"Browse gopls feature documentation" [gopls.doc.features]` +
+			"\n" +
+			`command	"Browse documentation for package a" [source.doc]` +
+			"\n"
 		if got != want {
-			t.Errorf("fix: got <<%s>>, want <<%s>>\nstderr:\n%s", got, want, res.stderr)
+			t.Errorf("codeaction: got <<%s>>, want <<%s>>\nstderr:\n%s", got, want, res.stderr)
+		}
+	}
+	// list code actions in file, filtering (hierarchically) by kind
+	{
+		res := gopls(t, tree, "codeaction", "-kind=source", "a.go")
+		res.checkExit(true)
+		got := res.stdout
+		want := `command	"Browse documentation for package a" [source.doc]` +
+			"\n" +
+			`command	"Toggle compiler optimization details" [source.toggleCompilerOptDetails]` +
+			"\n"
+		if got != want {
+			t.Errorf("codeaction: got <<%s>>, want <<%s>>\nstderr:\n%s", got, want, res.stderr)
+		}
+	}
+	// list code actions at position (of io.Reader)
+	{
+		res := gopls(t, tree, "codeaction", "b.go:#31")
+		res.checkExit(true)
+		res.checkStdout(`command	"Browse documentation for type io.Reader" \[source.doc]`)
+	}
+	// list quick fixes at position (of type T)
+	{
+		res := gopls(t, tree, "codeaction", "-kind=quickfix", "a.go:#15")
+		res.checkExit(true)
+		got := res.stdout
+		want := `edit	"Fill in return values" [quickfix]` + "\n"
+		if got != want {
+			t.Errorf("codeaction: got <<%s>>, want <<%s>>\nstderr:\n%s", got, want, res.stderr)
 		}
 	}
 	// success, with explicit CodeAction kind and diagnostics span.
 	{
-		res := gopls(t, tree, "fix", "-a", "b.go:#40", "quickfix")
+		res := gopls(t, tree, "codeaction", "-kind=quickfix", "-exec", "b.go:#40")
 		res.checkExit(true)
 		got := res.stdout
 		want := `
@@ -991,12 +1037,12 @@ func (c C) Read(p []byte) (n int, err error) {
 }
 `[1:]
 		if got != want {
-			t.Errorf("fix: got <<%s>>, want <<%s>>\nstderr:\n%s", got, want, res.stderr)
+			t.Errorf("codeaction: got <<%s>>, want <<%s>>\nstderr:\n%s", got, want, res.stderr)
 		}
 	}
 }
 
-// TestWorkspaceSymbol tests the 'workspace_symbol' subcommand (../workspace_symbol.go).
+// TestWorkspaceSymbol tests the 'workspace_symbol' subcommand (workspace_symbol.go).
 func TestWorkspaceSymbol(t *testing.T) {
 	t.Parallel()
 
@@ -1046,7 +1092,7 @@ func goplsMain() {
 		version.VersionOverride = v
 	}
 
-	tool.Main(context.Background(), cmd.New(hooks.Options), os.Args[1:])
+	tool.Main(context.Background(), cmd.New(), os.Args[1:])
 }
 
 // writeTree extracts a txtar archive into a new directory and returns its path.

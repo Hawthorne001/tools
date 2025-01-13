@@ -16,9 +16,9 @@ import (
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/golang"
+	"golang.org/x/tools/gopls/internal/label"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/event/tag"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/xcontext"
 )
@@ -61,9 +61,9 @@ const (
 	// ResetGoModDiagnostics command.
 	FromResetGoModDiagnostics
 
-	// FromToggleGCDetails refers to state changes resulting from toggling
-	// gc_details on or off for a package.
-	FromToggleGCDetails
+	// FromToggleCompilerOptDetails refers to state changes resulting from toggling
+	// a package's compiler optimization details flag.
+	FromToggleCompilerOptDetails
 )
 
 func (m ModificationSource) String() string {
@@ -92,7 +92,7 @@ func (m ModificationSource) String() string {
 }
 
 func (s *server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocumentParams) error {
-	ctx, done := event.Start(ctx, "lsp.Server.didOpen", tag.URI.Of(params.TextDocument.URI))
+	ctx, done := event.Start(ctx, "lsp.Server.didOpen", label.URI.Of(params.TextDocument.URI))
 	defer done()
 
 	uri := params.TextDocument.URI
@@ -105,7 +105,7 @@ func (s *server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 	// file is opened, and we can't do that inside didModifyFiles because we
 	// don't want to request configuration while holding a lock.
 	if len(s.session.Views()) == 0 {
-		dir := filepath.Dir(uri.Path())
+		dir := uri.DirPath()
 		s.addFolders(ctx, []protocol.WorkspaceFolder{{
 			URI:  string(protocol.URIFromPath(dir)),
 			Name: filepath.Base(dir),
@@ -121,7 +121,7 @@ func (s *server) DidOpen(ctx context.Context, params *protocol.DidOpenTextDocume
 }
 
 func (s *server) DidChange(ctx context.Context, params *protocol.DidChangeTextDocumentParams) error {
-	ctx, done := event.Start(ctx, "lsp.Server.didChange", tag.URI.Of(params.TextDocument.URI))
+	ctx, done := event.Start(ctx, "lsp.Server.didChange", label.URI.Of(params.TextDocument.URI))
 	defer done()
 
 	uri := params.TextDocument.URI
@@ -190,7 +190,7 @@ func (s *server) DidChangeWatchedFiles(ctx context.Context, params *protocol.Did
 }
 
 func (s *server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocumentParams) error {
-	ctx, done := event.Start(ctx, "lsp.Server.didSave", tag.URI.Of(params.TextDocument.URI))
+	ctx, done := event.Start(ctx, "lsp.Server.didSave", label.URI.Of(params.TextDocument.URI))
 	defer done()
 
 	c := file.Modification{
@@ -204,7 +204,7 @@ func (s *server) DidSave(ctx context.Context, params *protocol.DidSaveTextDocume
 }
 
 func (s *server) DidClose(ctx context.Context, params *protocol.DidCloseTextDocumentParams) error {
-	ctx, done := event.Start(ctx, "lsp.Server.didClose", tag.URI.Of(params.TextDocument.URI))
+	ctx, done := event.Start(ctx, "lsp.Server.didClose", label.URI.Of(params.TextDocument.URI))
 	defer done()
 
 	return s.didModifyFiles(ctx, []file.Modification{
@@ -374,19 +374,31 @@ func (s *server) checkEfficacy(uri protocol.DocumentURI, version int32, change p
 		if item.TextEdit == nil {
 			continue
 		}
-		if item.TextEdit.Range.Start == change.Range.Start {
+		// CompletionTextEdit may have both insert/replace mode ranges.
+		// According to the LSP spec, if an `InsertReplaceEdit` is returned
+		// the edit's insert range must be a prefix of the edit's replace range,
+		// that means it must be contained and starting at the same position.
+		// The efficacy computation uses only the start range, so it is not
+		// affected by whether the client applied the suggestion in insert
+		// or replace mode. Let's just use the replace mode that was the default
+		// in gopls for a while.
+		edit, err := protocol.SelectCompletionTextEdit(item, false)
+		if err != nil {
+			continue
+		}
+		if edit.Range.Start == change.Range.Start {
 			// the change and the proposed completion start at the same
 			if change.RangeLength == 0 && len(change.Text) == 1 {
 				// a single character added it does not count as a completion
 				continue
 			}
-			ix := strings.Index(item.TextEdit.NewText, "$")
-			if ix < 0 && strings.HasPrefix(change.Text, item.TextEdit.NewText) {
+			ix := strings.Index(edit.NewText, "$")
+			if ix < 0 && strings.HasPrefix(change.Text, edit.NewText) {
 				// not a snippet, suggested completion is a prefix of the change
 				complUsed.Inc()
 				return
 			}
-			if ix > 1 && strings.HasPrefix(change.Text, item.TextEdit.NewText[:ix]) {
+			if ix > 1 && strings.HasPrefix(change.Text, edit.NewText[:ix]) {
 				// a snippet, suggested completion up to $ marker is a prefix of the change
 				complUsed.Inc()
 				return

@@ -25,9 +25,9 @@ import (
 	"golang.org/x/tools/internal/refactor/inline"
 )
 
-// EnclosingStaticCall returns the innermost function call enclosing
+// enclosingStaticCall returns the innermost function call enclosing
 // the selected range, along with the callee.
-func EnclosingStaticCall(pkg *cache.Package, pgf *parsego.File, start, end token.Pos) (*ast.CallExpr, *types.Func, error) {
+func enclosingStaticCall(pkg *cache.Package, pgf *parsego.File, start, end token.Pos) (*ast.CallExpr, *types.Func, error) {
 	path, _ := astutil.PathEnclosingInterval(pgf.File, start, end)
 
 	var call *ast.CallExpr
@@ -56,7 +56,7 @@ loop:
 
 func inlineCall(ctx context.Context, snapshot *cache.Snapshot, callerPkg *cache.Package, callerPGF *parsego.File, start, end token.Pos) (_ *token.FileSet, _ *analysis.SuggestedFix, err error) {
 	// Find enclosing static call.
-	call, fn, err := EnclosingStaticCall(callerPkg, callerPGF, start, end)
+	call, fn, err := enclosingStaticCall(callerPkg, callerPGF, start, end)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -113,14 +113,14 @@ func inlineCall(ctx context.Context, snapshot *cache.Snapshot, callerPkg *cache.
 		Content: callerPGF.Src,
 	}
 
-	got, err := inline.Inline(logf, caller, callee)
+	res, err := inline.Inline(caller, callee, &inline.Options{Logf: logf})
 	if err != nil {
 		return nil, nil, err
 	}
 
 	return callerPkg.FileSet(), &analysis.SuggestedFix{
 		Message:   fmt.Sprintf("inline call of %v", callee),
-		TextEdits: diffToTextEdits(callerPGF.Tok, diff.Bytes(callerPGF.Src, got)),
+		TextEdits: diffToTextEdits(callerPGF.Tok, diff.Bytes(callerPGF.Src, res.Content)),
 	}, nil
 }
 

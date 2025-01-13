@@ -22,10 +22,6 @@ func (s *server) Declaration(context.Context, *protocol.DeclarationParams) (*pro
 	return nil, notImplemented("Declaration")
 }
 
-func (s *server) Diagnostic(context.Context, *string) (*string, error) {
-	return nil, notImplemented("Diagnostic")
-}
-
 func (s *server) DiagnosticWorkspace(context.Context, *protocol.WorkspaceDiagnosticParams) (*protocol.WorkspaceDiagnosticReport, error) {
 	return nil, notImplemented("DiagnosticWorkspace")
 }
@@ -152,6 +148,10 @@ func (s *server) WillSave(context.Context, *protocol.WillSaveTextDocumentParams)
 
 func (s *server) WillSaveWaitUntil(context.Context, *protocol.WillSaveTextDocumentParams) ([]protocol.TextEdit, error) {
 	return nil, notImplemented("WillSaveWaitUntil")
+}
+
+func (s *server) TextDocumentContent(context.Context, *protocol.TextDocumentContentParams) (*string, error) {
+	return nil, notImplemented("TextDocumentContent")
 }
 
 func notImplemented(method string) error {

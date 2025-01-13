@@ -14,16 +14,19 @@ import (
 	"flag"
 	"fmt"
 	"go/types"
+	"log"
 	"os"
 	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
+	"golang.org/x/tools/internal/drivertest"
 	"golang.org/x/tools/internal/tool"
 )
 
 func main() {
+	drivertest.RunIfChild()
 	tool.Main(context.Background(), &application{Mode: "imports"}, os.Args[1:])
 }
 
@@ -34,9 +37,11 @@ type application struct {
 	Deps       bool            `flag:"deps" help:"show dependencies too"`
 	Test       bool            `flag:"test" help:"include any tests implied by the patterns"`
 	Mode       string          `flag:"mode" help:"mode (one of files, imports, types, syntax, allsyntax)"`
+	Tags       string          `flag:"tags" help:"comma-separated list of extra build tags (see: go help buildconstraint)"`
 	Private    bool            `flag:"private" help:"show non-exported declarations too (if -mode=syntax)"`
 	PrintJSON  bool            `flag:"json" help:"print package in JSON form"`
 	BuildFlags stringListValue `flag:"buildflag" help:"pass argument to underlying build system (may be repeated)"`
+	Driver     bool            `flag:"driver" help:"use golist passthrough driver (for debugging driver issues)"`
 }
 
 // Name implements tool.Application returning the binary name.
@@ -82,11 +87,17 @@ func (app *application) Run(ctx context.Context, args ...string) error {
 		return tool.CommandLineErrorf("not enough arguments")
 	}
 
+	env := os.Environ()
+	if app.Driver {
+		env = append(env, drivertest.Env(log.Default())...)
+	}
+
 	// Load, parse, and type-check the packages named on the command line.
 	cfg := &packages.Config{
 		Mode:       packages.LoadSyntax,
 		Tests:      app.Test,
-		BuildFlags: app.BuildFlags,
+		BuildFlags: append([]string{"-tags=" + app.Tags}, app.BuildFlags...),
+		Env:        env,
 	}
 
 	// -mode flag
@@ -236,11 +247,6 @@ func (app *application) print(lpkg *packages.Package) {
 // stringListValue is a flag.Value that accumulates strings.
 // e.g. --flag=one --flag=two would produce []string{"one", "two"}.
 type stringListValue []string
-
-func newStringListValue(val []string, p *[]string) *stringListValue {
-	*p = val
-	return (*stringListValue)(p)
-}
 
 func (ss *stringListValue) Get() interface{} { return []string(*ss) }
 

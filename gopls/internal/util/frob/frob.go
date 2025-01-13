@@ -12,8 +12,7 @@
 //   - Interface values are not supported; this avoids the need for
 //     the encoding to describe types.
 //
-//   - Types that recursively contain private struct fields are not
-//     permitted.
+//   - Private struct fields are ignored.
 //
 //   - The encoding is unspecified and subject to change, so the encoder
 //     and decoder must exactly agree on their implementation and on the
@@ -104,7 +103,7 @@ func frobFor(t reflect.Type) *frob {
 			for i := 0; i < fr.t.NumField(); i++ {
 				field := fr.t.Field(i)
 				if field.PkgPath != "" {
-					panic(fmt.Sprintf("unexported field %v", field))
+					continue // skip unexported field
 				}
 				fr.addElem(field.Type)
 			}
@@ -245,8 +244,8 @@ func (fr *frob) Decode(data []byte, ptr any) {
 		panic(fmt.Sprintf("got %v, want %v", rv.Type(), fr.t))
 	}
 	rd := &reader{data}
-	if string(rd.bytes(4)) != magic {
-		panic("not a frob-encoded message")
+	if len(data) < len(magic) || string(rd.bytes(len(magic))) != magic {
+		panic("not a frob-encoded message") // (likely an empty message)
 	}
 	fr.decode(rd, rv)
 	if len(rd.data) > 0 {
@@ -327,14 +326,9 @@ func (fr *frob) decode(in *reader, addr reflect.Value) {
 			kfrob, vfrob := fr.elems[0], fr.elems[1]
 			k := reflect.New(kfrob.t).Elem()
 			v := reflect.New(vfrob.t).Elem()
-			kzero := reflect.Zero(kfrob.t)
-			vzero := reflect.Zero(vfrob.t)
 			for i := 0; i < len; i++ {
-				// TODO(adonovan): use SetZero from go1.20.
-				// k.SetZero()
-				// v.SetZero()
-				k.Set(kzero)
-				v.Set(vzero)
+				k.SetZero()
+				v.SetZero()
 				kfrob.decode(in, k)
 				vfrob.decode(in, v)
 				m.SetMapIndex(k, v)

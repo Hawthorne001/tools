@@ -12,10 +12,12 @@ import (
 	"go/format"
 	"go/token"
 	"go/types"
+	"regexp"
 	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/gopls/internal/util/safetoken"
 )
 
 const Doc = `check for unused variables and suggest fixes`
@@ -29,14 +31,19 @@ var Analyzer = &analysis.Analyzer{
 	URL:              "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedvariable",
 }
 
-// The suffix for this error message changed in Go 1.20.
-var unusedVariableSuffixes = []string{" declared and not used", " declared but not used"}
+// The suffix for this error message changed in Go 1.20 and Go 1.23.
+var unusedVariableRegexp = []*regexp.Regexp{
+	regexp.MustCompile("^(.*) declared but not used$"),
+	regexp.MustCompile("^(.*) declared and not used$"),  // Go 1.20+
+	regexp.MustCompile("^declared and not used: (.*)$"), // Go 1.23+
+}
 
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
 	for _, typeErr := range pass.TypeErrors {
-		for _, suffix := range unusedVariableSuffixes {
-			if strings.HasSuffix(typeErr.Msg, suffix) {
-				varName := strings.TrimSuffix(typeErr.Msg, suffix)
+		for _, re := range unusedVariableRegexp {
+			match := re.FindStringSubmatch(typeErr.Msg)
+			if len(match) > 0 {
+				varName := match[1]
 				// Beginning in Go 1.23, go/types began quoting vars as `v'.
 				varName = strings.Trim(varName, "'`'")
 
@@ -54,7 +61,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 func runForError(pass *analysis.Pass, err types.Error, name string) error {
 	var file *ast.File
 	for _, f := range pass.Files {
-		if f.Pos() <= err.Pos && err.Pos < f.End() {
+		if f.FileStart <= err.Pos && err.Pos < f.FileEnd {
 			file = f
 			break
 		}
@@ -107,7 +114,7 @@ func runForError(pass *analysis.Pass, err types.Error, name string) error {
 				continue
 			}
 
-			fixes := removeVariableFromAssignment(path, stmt, ident)
+			fixes := removeVariableFromAssignment(pass.Fset, path, stmt, ident)
 			// fixes may be nil
 			if len(fixes) > 0 {
 				diag.SuggestedFixes = fixes
@@ -158,7 +165,7 @@ func removeVariableFromSpec(pass *analysis.Pass, path []ast.Node, stmt *ast.Valu
 		// Find parent DeclStmt and delete it
 		for _, node := range path {
 			if declStmt, ok := node.(*ast.DeclStmt); ok {
-				edits := deleteStmtFromBlock(path, declStmt)
+				edits := deleteStmtFromBlock(pass.Fset, path, declStmt)
 				if len(edits) == 0 {
 					return nil // can this happen?
 				}
@@ -192,7 +199,7 @@ func removeVariableFromSpec(pass *analysis.Pass, path []ast.Node, stmt *ast.Valu
 	}
 }
 
-func removeVariableFromAssignment(path []ast.Node, stmt *ast.AssignStmt, ident *ast.Ident) []analysis.SuggestedFix {
+func removeVariableFromAssignment(fset *token.FileSet, path []ast.Node, stmt *ast.AssignStmt, ident *ast.Ident) []analysis.SuggestedFix {
 	// The only variable in the assignment is unused
 	if len(stmt.Lhs) == 1 {
 		// If LHS has only one expression to be valid it has to have 1 expression
@@ -215,7 +222,7 @@ func removeVariableFromAssignment(path []ast.Node, stmt *ast.AssignStmt, ident *
 		}
 
 		// RHS does not have any side effects, delete the whole statement
-		edits := deleteStmtFromBlock(path, stmt)
+		edits := deleteStmtFromBlock(fset, path, stmt)
 		if len(edits) == 0 {
 			return nil // can this happen?
 		}
@@ -246,7 +253,7 @@ func suggestedFixMessage(name string) string {
 	return fmt.Sprintf("Remove variable %s", name)
 }
 
-func deleteStmtFromBlock(path []ast.Node, stmt ast.Stmt) []analysis.TextEdit {
+func deleteStmtFromBlock(fset *token.FileSet, path []ast.Node, stmt ast.Stmt) []analysis.TextEdit {
 	// Find innermost enclosing BlockStmt.
 	var block *ast.BlockStmt
 	for i := range path {
@@ -274,6 +281,31 @@ func deleteStmtFromBlock(path []ast.Node, stmt ast.Stmt) []analysis.TextEdit {
 	end := block.Rbrace
 	if nodeIndex < len(block.List)-1 {
 		end = block.List[nodeIndex+1].Pos()
+	}
+
+	// Account for comments within the block containing the statement
+	// TODO(adonovan): when golang/go#20744 is addressed, query the AST
+	// directly for comments between stmt.End() and end. For now we
+	// must scan the entire file's comments (though we could binary search).
+	astFile := path[len(path)-1].(*ast.File)
+	currFile := fset.File(end)
+	stmtEndLine := safetoken.Line(currFile, stmt.End())
+outer:
+	for _, cg := range astFile.Comments {
+		for _, co := range cg.List {
+			if stmt.End() <= co.Pos() && co.Pos() <= end {
+				coLine := safetoken.Line(currFile, co.Pos())
+				// If a comment exists within the current block, after the unused variable statement,
+				// and before the next statement, we shouldn't delete it.
+				if coLine > stmtEndLine {
+					end = co.Pos()
+					break outer
+				}
+				if co.Pos() > end {
+					break outer
+				}
+			}
+		}
 	}
 
 	return []analysis.TextEdit{

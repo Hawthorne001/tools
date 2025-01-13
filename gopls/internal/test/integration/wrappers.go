@@ -5,7 +5,8 @@
 package integration
 
 import (
-	"encoding/json"
+	"errors"
+	"os"
 	"path"
 
 	"golang.org/x/tools/gopls/internal/protocol"
@@ -114,16 +115,39 @@ func (e *Env) SetBufferContent(name string, content string) {
 	}
 }
 
-// ReadFile returns the file content for name that applies to the current
-// editing session: if the file is open, it returns its buffer content,
-// otherwise it returns on disk content.
+// FileContent returns the file content for name that applies to the current
+// editing session: it returns the buffer content for an open file, the
+// on-disk content for an unopened file, or "" for a non-existent file.
 func (e *Env) FileContent(name string) string {
 	e.T.Helper()
 	text, ok := e.Editor.BufferText(name)
 	if ok {
 		return text
 	}
-	return e.ReadWorkspaceFile(name)
+	content, err := e.Sandbox.Workdir.ReadFile(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ""
+		} else {
+			e.T.Fatal(err)
+		}
+	}
+	return string(content)
+}
+
+// FileContentAt returns the file content at the given location, using the
+// file's mapper.
+func (e *Env) FileContentAt(location protocol.Location) string {
+	e.T.Helper()
+	mapper, err := e.Editor.Mapper(location.URI.Path())
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	start, end, err := mapper.RangeOffsets(location.Range)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return string(mapper.Content[start:end])
 }
 
 // RegexpSearch returns the starting position of the first match for re in the
@@ -207,13 +231,13 @@ func (e *Env) OrganizeImports(name string) {
 // ApplyQuickFixes processes the quickfix codeAction, calling t.Fatal on any error.
 func (e *Env) ApplyQuickFixes(path string, diagnostics []protocol.Diagnostic) {
 	e.T.Helper()
-	loc := protocol.Location{URI: e.Sandbox.Workdir.URI(path)} // zero Range => whole file
+	loc := e.Sandbox.Workdir.EntireFile(path)
 	if err := e.Editor.ApplyQuickFixes(e.Ctx, loc, diagnostics); err != nil {
 		e.T.Fatal(err)
 	}
 }
 
-// ApplyCodeAction applies the given code action.
+// ApplyCodeAction applies the given code action, calling t.Fatal on any error.
 func (e *Env) ApplyCodeAction(action protocol.CodeAction) {
 	e.T.Helper()
 	if err := e.Editor.ApplyCodeAction(e.Ctx, action); err != nil {
@@ -221,10 +245,22 @@ func (e *Env) ApplyCodeAction(action protocol.CodeAction) {
 	}
 }
 
-// GetQuickFixes returns the available quick fix code actions.
+// Diagnostics returns diagnostics for the given file, calling t.Fatal on any
+// error.
+func (e *Env) Diagnostics(name string) []protocol.Diagnostic {
+	e.T.Helper()
+	diags, err := e.Editor.Diagnostics(e.Ctx, name)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return diags
+}
+
+// GetQuickFixes returns the available quick fix code actions, calling t.Fatal
+// on any error.
 func (e *Env) GetQuickFixes(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
 	e.T.Helper()
-	loc := protocol.Location{URI: e.Sandbox.Workdir.URI(path)} // zero Range => whole file
+	loc := e.Sandbox.Workdir.EntireFile(path)
 	actions, err := e.Editor.GetQuickFixes(e.Ctx, loc, diagnostics)
 	if err != nil {
 		e.T.Fatal(err)
@@ -233,6 +269,7 @@ func (e *Env) GetQuickFixes(path string, diagnostics []protocol.Diagnostic) []pr
 }
 
 // Hover in the editor, calling t.Fatal on any error.
+// It may return (nil, zero) even on success.
 func (e *Env) Hover(loc protocol.Location) (*protocol.MarkupContent, protocol.Location) {
 	e.T.Helper()
 	c, loc, err := e.Editor.Hover(e.Ctx, loc)
@@ -277,18 +314,20 @@ func (e *Env) RunGenerate(dir string) {
 
 // RunGoCommand runs the given command in the sandbox's default working
 // directory.
-func (e *Env) RunGoCommand(verb string, args ...string) {
+func (e *Env) RunGoCommand(verb string, args ...string) []byte {
 	e.T.Helper()
-	if err := e.Sandbox.RunGoCommand(e.Ctx, "", verb, args, nil, true); err != nil {
+	out, err := e.Sandbox.RunGoCommand(e.Ctx, "", verb, args, nil, true)
+	if err != nil {
 		e.T.Fatal(err)
 	}
+	return out
 }
 
 // RunGoCommandInDir is like RunGoCommand, but executes in the given
 // relative directory of the sandbox.
 func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
 	e.T.Helper()
-	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args, nil, true); err != nil {
+	if _, err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args, nil, true); err != nil {
 		e.T.Fatal(err)
 	}
 }
@@ -297,7 +336,7 @@ func (e *Env) RunGoCommandInDir(dir, verb string, args ...string) {
 // relative directory of the sandbox with the given additional environment variables.
 func (e *Env) RunGoCommandInDirWithEnv(dir string, env []string, verb string, args ...string) {
 	e.T.Helper()
-	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args, env, true); err != nil {
+	if _, err := e.Sandbox.RunGoCommand(e.Ctx, dir, verb, args, env, true); err != nil {
 		e.T.Fatal(err)
 	}
 }
@@ -318,7 +357,7 @@ func (e *Env) GoVersion() int {
 func (e *Env) DumpGoSum(dir string) {
 	e.T.Helper()
 
-	if err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "./..."}, nil, true); err != nil {
+	if _, err := e.Sandbox.RunGoCommand(e.Ctx, dir, "list", []string{"-mod=mod", "./..."}, nil, true); err != nil {
 		e.T.Fatal(err)
 	}
 	sumFile := path.Join(dir, "go.sum")
@@ -349,46 +388,22 @@ func (e *Env) CodeLens(path string) []protocol.CodeLens {
 
 // ExecuteCodeLensCommand executes the command for the code lens matching the
 // given command name.
-func (e *Env) ExecuteCodeLensCommand(path string, cmd command.Command, result interface{}) {
+//
+// result is a pointer to a variable to be populated by json.Unmarshal.
+func (e *Env) ExecuteCodeLensCommand(path string, cmd command.Command, result any) {
 	e.T.Helper()
-	lenses := e.CodeLens(path)
-	var lens protocol.CodeLens
-	var found bool
-	for _, l := range lenses {
-		if l.Command.Command == cmd.ID() {
-			lens = l
-			found = true
-		}
+	if err := e.Editor.ExecuteCodeLensCommand(e.Ctx, path, cmd, result); err != nil {
+		e.T.Fatal(err)
 	}
-	if !found {
-		e.T.Fatalf("found no command with the ID %s", cmd.ID())
-	}
-	e.ExecuteCommand(&protocol.ExecuteCommandParams{
-		Command:   lens.Command.Command,
-		Arguments: lens.Command.Arguments,
-	}, result)
 }
 
-func (e *Env) ExecuteCommand(params *protocol.ExecuteCommandParams, result interface{}) {
+// ExecuteCommand executes the requested command in the editor, calling t.Fatal
+// on any error.
+//
+// result is a pointer to a variable to be populated by json.Unmarshal.
+func (e *Env) ExecuteCommand(params *protocol.ExecuteCommandParams, result any) {
 	e.T.Helper()
-	response, err := e.Editor.ExecuteCommand(e.Ctx, params)
-	if err != nil {
-		e.T.Fatal(err)
-	}
-	if result == nil {
-		return
-	}
-	// Hack: The result of an executeCommand request will be unmarshaled into
-	// maps. Re-marshal and unmarshal into the type we expect.
-	//
-	// This could be improved by generating a jsonrpc2 command client from the
-	// command.Interface, but that should only be done if we're consolidating
-	// this part of the tsprotocol generation.
-	data, err := json.Marshal(response)
-	if err != nil {
-		e.T.Fatal(err)
-	}
-	if err := json.Unmarshal(data, result); err != nil {
+	if err := e.Editor.ExecuteCommand(e.Ctx, params, result); err != nil {
 		e.T.Fatal(err)
 	}
 }
@@ -396,10 +411,7 @@ func (e *Env) ExecuteCommand(params *protocol.ExecuteCommandParams, result inter
 // Views returns the server's views.
 func (e *Env) Views() []command.View {
 	var summaries []command.View
-	cmd, err := command.NewViewsCommand("")
-	if err != nil {
-		e.T.Fatal(err)
-	}
+	cmd := command.NewViewsCommand("")
 	e.ExecuteCommand(&protocol.ExecuteCommandParams{
 		Command:   cmd.Command,
 		Arguments: cmd.Arguments,
@@ -421,7 +433,7 @@ func (e *Env) StartProfile() (stop func() string) {
 		e.T.Fatal(err)
 	}
 	params := &protocol.ExecuteCommandParams{
-		Command:   command.StartProfile.ID(),
+		Command:   command.StartProfile.String(),
 		Arguments: args,
 	}
 	var result command.StartProfileResult
@@ -433,7 +445,7 @@ func (e *Env) StartProfile() (stop func() string) {
 			e.T.Fatal(err)
 		}
 		stopParams := &protocol.ExecuteCommandParams{
-			Command:   command.StopProfile.ID(),
+			Command:   command.StopProfile.String(),
 			Arguments: stopArgs,
 		}
 		var result command.StopProfileResult
@@ -519,6 +531,11 @@ func (e *Env) Completion(loc protocol.Location) *protocol.CompletionList {
 	return completions
 }
 
+func (e *Env) SetSuggestionInsertReplaceMode(useReplaceMode bool) {
+	e.T.Helper()
+	e.Editor.SetSuggestionInsertReplaceMode(e.Ctx, useReplaceMode)
+}
+
 // AcceptCompletion accepts a completion for the given item at the given
 // position.
 func (e *Env) AcceptCompletion(loc protocol.Location, item protocol.CompletionItem) {
@@ -528,12 +545,17 @@ func (e *Env) AcceptCompletion(loc protocol.Location, item protocol.CompletionIt
 	}
 }
 
-// CodeAction calls textDocument/codeAction for the given path, and calls
-// t.Fatal if there are errors.
-func (e *Env) CodeAction(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
+// CodeActionForFile calls textDocument/codeAction for the entire
+// file, and calls t.Fatal if there were errors.
+func (e *Env) CodeActionForFile(path string, diagnostics []protocol.Diagnostic) []protocol.CodeAction {
+	return e.CodeAction(e.Sandbox.Workdir.EntireFile(path), diagnostics, protocol.CodeActionUnknownTrigger)
+}
+
+// CodeAction calls textDocument/codeAction for a selection,
+// and calls t.Fatal if there were errors.
+func (e *Env) CodeAction(loc protocol.Location, diagnostics []protocol.Diagnostic, trigger protocol.CodeActionTriggerKind) []protocol.CodeAction {
 	e.T.Helper()
-	loc := protocol.Location{URI: e.Sandbox.Workdir.URI(path)} // no Range => whole file
-	actions, err := e.Editor.CodeAction(e.Ctx, loc, diagnostics)
+	actions, err := e.Editor.CodeAction(e.Ctx, loc, diagnostics, trigger)
 	if err != nil {
 		e.T.Fatal(err)
 	}

@@ -145,7 +145,7 @@ func TestEverything(t *testing.T) {
 					t.Logf("callee declared at %v",
 						filepath.Base(calleePosn.String()))
 
-					t.Logf("run this command to reproduce locally:\n$ gopls fix -a -d %s:#%d refactor.inline",
+					t.Logf("run this command to reproduce locally:\n$ gopls codeaction -kind=refactor.inline -exec -diff %s:#%d",
 						callPosn.Filename, callPosn.Offset)
 
 					callee, err := inline.AnalyzeCallee(
@@ -173,16 +173,19 @@ func TestEverything(t *testing.T) {
 						t.Fatal(err)
 					}
 
-					got, err := inline.Inline(t.Logf, caller, callee)
+					res, err := inline.Inline(caller, callee, &inline.Options{
+						Logf: t.Logf,
+					})
 					if err != nil {
 						// Write error to a log, but this ok.
 						t.Log(err)
 						return
 					}
+					got := res.Content
 
 					// Print the diff.
 					t.Logf("Got diff:\n%s",
-						diff.Unified("old", "new", string(callerContent), string(got)))
+						diff.Unified("old", "new", string(callerContent), string(res.Content)))
 
 					// Parse and type-check the transformed source.
 					f, err := parser.ParseFile(caller.Fset, callPosn.Filename, got, parser.SkipObjectResolution)

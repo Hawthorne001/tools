@@ -8,9 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,12 +21,13 @@ import (
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/typerefs"
 	"golang.org/x/tools/gopls/internal/file"
+	"golang.org/x/tools/gopls/internal/label"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/persistent"
-	"golang.org/x/tools/gopls/internal/util/slices"
 	"golang.org/x/tools/gopls/internal/vulncheck"
 	"golang.org/x/tools/internal/event"
+	"golang.org/x/tools/internal/event/keys"
 	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/imports"
 	"golang.org/x/tools/internal/memoize"
@@ -61,7 +63,7 @@ type Session struct {
 
 	viewMu  sync.Mutex
 	views   []*View
-	viewMap map[protocol.DocumentURI]*View // file->best view; nil after shutdown
+	viewMap map[protocol.DocumentURI]*View // file->best view or nil; nil after shutdown
 
 	// snapshots is a counting semaphore that records the number
 	// of unreleased snapshots associated with this session.
@@ -114,6 +116,10 @@ var ErrViewExists = errors.New("view already exists for session")
 func (s *Session) NewView(ctx context.Context, folder *Folder) (*View, *Snapshot, func(), error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
+
+	if s.viewMap == nil {
+		return nil, nil, nil, fmt.Errorf("session is shut down")
+	}
 
 	// Querying the file system to check whether
 	// two folders denote the same existing directory.
@@ -185,7 +191,7 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		} else {
 			dirs = append(dirs, def.folder.Env.GOMODCACHE)
 			for m := range def.workspaceModFiles {
-				dirs = append(dirs, filepath.Dir(m.Path()))
+				dirs = append(dirs, m.DirPath())
 			}
 		}
 		ignoreFilter = newIgnoreFilter(dirs)
@@ -212,7 +218,7 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 			ModCache:       s.cache.modCache.dirCache(def.folder.Env.GOMODCACHE),
 		}
 		if def.folder.Options.VerboseOutput {
-			pe.Logf = func(format string, args ...interface{}) {
+			pe.Logf = func(format string, args ...any) {
 				event.Log(ctx, fmt.Sprintf(format, args...))
 			}
 		}
@@ -224,36 +230,39 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 		initialWorkspaceLoad: make(chan struct{}),
 		initializationSema:   make(chan struct{}, 1),
 		baseCtx:              baseCtx,
+		pkgIndex:             typerefs.NewPackageIndex(),
 		parseCache:           s.parseCache,
 		ignoreFilter:         ignoreFilter,
 		fs:                   s.overlayFS,
 		viewDefinition:       def,
 		importsState:         newImportsState(backgroundCtx, s.cache.modCache, pe),
 	}
+	if def.folder.Options.ImportsSource != "off" {
+		v.modcacheState = newModcacheState(def.folder.Env.GOMODCACHE)
+	}
 
 	s.snapshotWG.Add(1)
 	v.snapshot = &Snapshot{
-		view:             v,
-		backgroundCtx:    backgroundCtx,
-		cancel:           cancel,
-		store:            s.cache.store,
-		refcount:         1, // Snapshots are born referenced.
-		done:             s.snapshotWG.Done,
-		packages:         new(persistent.Map[PackageID, *packageHandle]),
-		meta:             new(metadata.Graph),
-		files:            newFileMap(),
-		activePackages:   new(persistent.Map[PackageID, *Package]),
-		symbolizeHandles: new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
-		shouldLoad:       new(persistent.Map[PackageID, []PackagePath]),
-		unloadableFiles:  new(persistent.Set[protocol.DocumentURI]),
-		parseModHandles:  new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
-		parseWorkHandles: new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
-		modTidyHandles:   new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
-		modVulnHandles:   new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
-		modWhyHandles:    new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
-		pkgIndex:         typerefs.NewPackageIndex(),
-		moduleUpgrades:   new(persistent.Map[protocol.DocumentURI, map[string]string]),
-		vulns:            new(persistent.Map[protocol.DocumentURI, *vulncheck.Result]),
+		view:              v,
+		backgroundCtx:     backgroundCtx,
+		cancel:            cancel,
+		store:             s.cache.store,
+		refcount:          1, // Snapshots are born referenced.
+		done:              s.snapshotWG.Done,
+		packages:          new(persistent.Map[PackageID, *packageHandle]),
+		fullAnalysisKeys:  new(persistent.Map[PackageID, file.Hash]),
+		factyAnalysisKeys: new(persistent.Map[PackageID, file.Hash]),
+		meta:              new(metadata.Graph),
+		files:             newFileMap(),
+		shouldLoad:        new(persistent.Map[PackageID, []PackagePath]),
+		unloadableFiles:   new(persistent.Set[protocol.DocumentURI]),
+		parseModHandles:   new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		parseWorkHandles:  new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		modTidyHandles:    new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		modVulnHandles:    new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		modWhyHandles:     new(persistent.Map[protocol.DocumentURI, *memoize.Promise]),
+		moduleUpgrades:    new(persistent.Map[protocol.DocumentURI, map[string]string]),
+		vulns:             new(persistent.Map[protocol.DocumentURI, *vulncheck.Result]),
 	}
 
 	// Snapshots must observe all open files, as there are some caching
@@ -263,7 +272,15 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 	}
 
 	// Record the environment of the newly created view in the log.
-	event.Log(ctx, viewEnv(v))
+	event.Log(ctx, fmt.Sprintf("Created View (#%s)", v.id),
+		label.Directory.Of(v.folder.Dir.Path()),
+		viewTypeKey.Of(v.typ.String()),
+		rootDirKey.Of(string(v.root)),
+		goVersionKey.Of(strings.TrimRight(v.folder.Env.GoVersionOutput, "\n")),
+		buildFlagsKey.Of(fmt.Sprint(v.folder.Options.BuildFlags)),
+		envKey.Of(fmt.Sprintf("%+v", v.folder.Env)),
+		envOverlayKey.Of(v.EnvOverlay()),
+	)
 
 	// Initialize the view without blocking.
 	initCtx, initCancel := context.WithCancel(xcontext.Detach(ctx))
@@ -281,24 +298,42 @@ func (s *Session) createView(ctx context.Context, def *viewDefinition) (*View, *
 	return v, snapshot, snapshot.Acquire()
 }
 
+// These keys are used to log view metadata in createView.
+var (
+	viewTypeKey   = keys.NewString("view_type", "")
+	rootDirKey    = keys.NewString("root_dir", "")
+	goVersionKey  = keys.NewString("go_version", "")
+	buildFlagsKey = keys.New("build_flags", "")
+	envKey        = keys.New("env", "")
+	envOverlayKey = keys.New("env_overlay", "")
+)
+
 // RemoveView removes from the session the view rooted at the specified directory.
 // It reports whether a view of that directory was removed.
-func (s *Session) RemoveView(dir protocol.DocumentURI) bool {
+func (s *Session) RemoveView(ctx context.Context, dir protocol.DocumentURI) bool {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
+
+	if s.viewMap == nil {
+		return false // Session is shutdown.
+	}
+	s.viewMap = make(map[protocol.DocumentURI]*View) // reset view associations
+
+	var newViews []*View
 	for _, view := range s.views {
 		if view.folder.Dir == dir {
-			i := s.dropView(view)
-			if i == -1 {
-				return false // can't happen
-			}
-			// delete this view... we don't care about order but we do want to make
-			// sure we can garbage collect the view
-			s.views = removeElement(s.views, i)
-			return true
+			view.shutdown()
+		} else {
+			newViews = append(newViews, view)
 		}
 	}
-	return false
+	removed := len(s.views) - len(newViews)
+	if removed != 1 {
+		// This isn't a bug report, because it could be a client-side bug.
+		event.Error(ctx, "removing view", fmt.Errorf("removed %d views, want exactly 1", removed))
+	}
+	s.views = newViews
+	return removed > 0
 }
 
 // View returns the view with a matching id, if present.
@@ -316,7 +351,7 @@ func (s *Session) View(id string) (*View, error) {
 // SnapshotOf returns a Snapshot corresponding to the given URI.
 //
 // In the case where the file can be  can be associated with a View by
-// bestViewForURI (based on directory information alone, without package
+// [RelevantViews] (based on directory information alone, without package
 // metadata), SnapshotOf returns the current Snapshot for that View. Otherwise,
 // it awaits loading package metadata and returns a Snapshot for the first View
 // containing a real (=not command-line-arguments) package for the file.
@@ -369,11 +404,11 @@ func (s *Session) SnapshotOf(ctx context.Context, uri protocol.DocumentURI) (*Sn
 		if err != nil {
 			continue // view was shut down
 		}
-		_ = snapshot.awaitLoaded(ctx) // ignore error
-		g := snapshot.MetadataGraph()
 		// We don't check the error from awaitLoaded, because a load failure (that
 		// doesn't result from context cancelation) should not prevent us from
 		// continuing to search for the best view.
+		_ = snapshot.awaitLoaded(ctx)
+		g := snapshot.MetadataGraph()
 		if ctx.Err() != nil {
 			release()
 			return nil, nil, ctx.Err()
@@ -407,12 +442,16 @@ func (s *Session) SnapshotOf(ctx context.Context, uri protocol.DocumentURI) (*Sn
 // we have no view containing a file.
 var errNoViews = errors.New("no views")
 
-// viewOfLocked wraps bestViewForURI, memoizing its result.
+// viewOfLocked evaluates the best view for uri, memoizing its result in
+// s.viewMap.
 //
 // Precondition: caller holds s.viewMu lock.
 //
-// May return (nil, nil).
+// May return (nil, nil) if no best view can be determined.
 func (s *Session) viewOfLocked(ctx context.Context, uri protocol.DocumentURI) (*View, error) {
+	if s.viewMap == nil {
+		return nil, errors.New("session is shut down")
+	}
 	v, hit := s.viewMap[uri]
 	if !hit {
 		// Cache miss: compute (and memoize) the best view.
@@ -420,14 +459,20 @@ func (s *Session) viewOfLocked(ctx context.Context, uri protocol.DocumentURI) (*
 		if err != nil {
 			return nil, err
 		}
-		v, err = bestView(ctx, s, fh, s.views)
+		relevantViews, err := RelevantViews(ctx, s, fh.URI(), s.views)
 		if err != nil {
 			return nil, err
 		}
-		if s.viewMap == nil {
-			return nil, errors.New("session is shut down")
+		v = matchingView(fh, relevantViews)
+		if v == nil && len(relevantViews) > 0 {
+			// If we have relevant views, but none of them matched the file's build
+			// constraints, then we are still better off using one of them here.
+			// Otherwise, logic may fall back to an inferior view, which lacks
+			// relevant module information, leading to misleading diagnostics.
+			// (as in golang/go#60776).
+			v = relevantViews[0]
 		}
-		s.viewMap[uri] = v
+		s.viewMap[uri] = v // may be nil
 	}
 	return v, nil
 }
@@ -497,24 +542,24 @@ checkFiles:
 		if err != nil {
 			return nil, err
 		}
-		def, err := bestView(ctx, fs, fh, defs)
+		relevantViews, err := RelevantViews(ctx, fs, fh.URI(), defs)
 		if err != nil {
 			// We should never call selectViewDefs with a cancellable context, so
 			// this should never fail.
 			return nil, bug.Errorf("failed to find best view for open file: %v", err)
 		}
+		def := matchingView(fh, relevantViews)
 		if def != nil {
 			continue // file covered by an existing view
 		}
 		def, err = defineView(ctx, fs, folder, fh)
 		if err != nil {
-			// We should never call selectViewDefs with a cancellable context, so
-			// this should never fail.
-			return nil, bug.Errorf("failed to define view for open file: %v", err)
+			// e.g. folder path is invalid?
+			return nil, fmt.Errorf("failed to define view for open file: %v", err)
 		}
 		// It need not strictly be the case that the best view for a file is
 		// distinct from other views, as the logic of getViewDefinition and
-		// bestViewForURI does not align perfectly. This is not necessarily a bug:
+		// [RelevantViews] does not align perfectly. This is not necessarily a bug:
 		// there may be files for which we can't construct a valid view.
 		//
 		// Nevertheless, we should not create redundant views.
@@ -529,14 +574,15 @@ checkFiles:
 	return defs, nil
 }
 
-// The viewDefiner interface allows the bestView algorithm to operate on both
+// The viewDefiner interface allows the [RelevantViews] algorithm to operate on both
 // Views and viewDefinitions.
 type viewDefiner interface{ definition() *viewDefinition }
 
-// BestViews returns the most relevant subset of views for a given uri.
-//
-// This may be used to filter diagnostics to the most relevant builds.
-func BestViews[V viewDefiner](ctx context.Context, fs file.Source, uri protocol.DocumentURI, views []V) ([]V, error) {
+// RelevantViews returns the views that may contain the given URI, or nil if
+// none exist. A view is "relevant" if, ignoring build constraints, it may have
+// a workspace package containing uri. Therefore, the definition of relevance
+// depends on the view type.
+func RelevantViews[V viewDefiner](ctx context.Context, fs file.Source, uri protocol.DocumentURI, views []V) ([]V, error) {
 	if len(views) == 0 {
 		return nil, nil // avoid the call to findRootPattern
 	}
@@ -609,121 +655,91 @@ func BestViews[V viewDefiner](ctx context.Context, fs file.Source, uri protocol.
 	//
 	// We only consider one type of view, since the matching view created by
 	// defineView should be of the best type.
-	var bestViews []V
+	var relevantViews []V
 	switch {
 	case len(workViews) > 0:
-		bestViews = workViews
+		relevantViews = workViews
 	case len(modViews) > 0:
-		bestViews = modViews
+		relevantViews = modViews
 	case len(gopathViews) > 0:
-		bestViews = gopathViews
+		relevantViews = gopathViews
 	case len(goPackagesViews) > 0:
-		bestViews = goPackagesViews
+		relevantViews = goPackagesViews
 	case len(adHocViews) > 0:
-		bestViews = adHocViews
+		relevantViews = adHocViews
 	}
 
-	return bestViews, nil
+	return relevantViews, nil
 }
 
-// bestView returns the best View or viewDefinition that contains the
-// given file, or (nil, nil) if no matching view is found.
-//
-// bestView only returns an error in the event of context cancellation.
+// matchingView returns the View or viewDefinition out of relevantViews that
+// matches the given file's build constraints, or nil if no match is found.
 //
 // Making this function generic is convenient so that we can avoid mapping view
 // definitions back to views inside Session.DidModifyFiles, where performance
 // matters. It is, however, not the cleanest application of generics.
 //
 // Note: keep this function in sync with defineView.
-func bestView[V viewDefiner](ctx context.Context, fs file.Source, fh file.Handle, views []V) (V, error) {
+func matchingView[V viewDefiner](fh file.Handle, relevantViews []V) V {
 	var zero V
-	bestViews, err := BestViews(ctx, fs, fh.URI(), views)
-	if err != nil || len(bestViews) == 0 {
-		return zero, err
+
+	if len(relevantViews) == 0 {
+		return zero
 	}
 
 	content, err := fh.Content()
+
 	// Port matching doesn't apply to non-go files, or files that no longer exist.
 	// Note that the behavior here on non-existent files shouldn't matter much,
-	// since there will be a subsequent failure. But it is simpler to preserve
-	// the invariant that bestView only fails on context cancellation.
+	// since there will be a subsequent failure.
 	if fileKind(fh) != file.Go || err != nil {
-		return bestViews[0], nil
+		return relevantViews[0]
 	}
 
 	// Find the first view that matches constraints.
 	// Content trimming is nontrivial, so do this outside of the loop below.
 	path := fh.URI().Path()
 	content = trimContentForPortMatch(content)
-	for _, v := range bestViews {
+	for _, v := range relevantViews {
 		def := v.definition()
 		viewPort := port{def.GOOS(), def.GOARCH()}
 		if viewPort.matches(path, content) {
-			return v, nil
+			return v
 		}
 	}
 
-	return zero, nil // no view found
-}
-
-// updateViewLocked recreates the view with the given options.
-//
-// If the resulting error is non-nil, the view may or may not have already been
-// dropped from the session.
-func (s *Session) updateViewLocked(ctx context.Context, view *View, def *viewDefinition) (*View, error) {
-	i := s.dropView(view)
-	if i == -1 {
-		return nil, fmt.Errorf("view %q not found", view.id)
-	}
-
-	view, _, release := s.createView(ctx, def)
-	defer release()
-
-	// substitute the new view into the array where the old view was
-	s.views[i] = view
-	s.viewMap = make(map[protocol.DocumentURI]*View)
-	return view, nil
-}
-
-// removeElement removes the ith element from the slice replacing it with the last element.
-// TODO(adonovan): generics, someday.
-func removeElement(slice []*View, index int) []*View {
-	last := len(slice) - 1
-	slice[index] = slice[last]
-	slice[last] = nil // aid GC
-	return slice[:last]
-}
-
-// dropView removes v from the set of views for the receiver s and calls
-// v.shutdown, returning the index of v in s.views (if found), or -1 if v was
-// not found. s.viewMu must be held while calling this function.
-func (s *Session) dropView(v *View) int {
-	// we always need to drop the view map
-	s.viewMap = make(map[protocol.DocumentURI]*View)
-	for i := range s.views {
-		if v == s.views[i] {
-			// we found the view, drop it and return the index it was found at
-			s.views[i] = nil
-			v.shutdown()
-			return i
-		}
-	}
-	// TODO(rfindley): it looks wrong that we don't shutdown v in this codepath.
-	// We should never get here.
-	bug.Reportf("tried to drop nonexistent view %q", v.id)
-	return -1
+	return zero // no view found
 }
 
 // ResetView resets the best view for the given URI.
 func (s *Session) ResetView(ctx context.Context, uri protocol.DocumentURI) (*View, error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
-	v, err := s.viewOfLocked(ctx, uri)
+
+	if s.viewMap == nil {
+		return nil, fmt.Errorf("session is shut down")
+	}
+
+	view, err := s.viewOfLocked(ctx, uri)
 	if err != nil {
 		return nil, err
 	}
-	return s.updateViewLocked(ctx, v, v.viewDefinition)
+	if view == nil {
+		return nil, fmt.Errorf("no view for %s", uri)
+	}
+
+	s.viewMap = make(map[protocol.DocumentURI]*View)
+	for i, v := range s.views {
+		if v == view {
+			v2, _, release := s.createView(ctx, view.viewDefinition)
+			release() // don't need the snapshot
+			v.shutdown()
+			s.views[i] = v2
+			return v2, nil
+		}
+	}
+
+	return nil, bug.Errorf("missing view") // can't happen...
 }
 
 // DidModifyFiles reports a file modification to the session. It returns
@@ -738,6 +754,11 @@ func (s *Session) ResetView(ctx context.Context, uri protocol.DocumentURI) (*Vie
 func (s *Session) DidModifyFiles(ctx context.Context, modifications []file.Modification) (map[*View][]protocol.DocumentURI, error) {
 	s.viewMu.Lock()
 	defer s.viewMu.Unlock()
+
+	// Short circuit the logic below if s is shut down.
+	if s.viewMap == nil {
+		return nil, fmt.Errorf("session is shut down")
+	}
 
 	// Update overlays.
 	//
@@ -815,9 +836,7 @@ func (s *Session) DidModifyFiles(ctx context.Context, modifications []file.Modif
 			openFiles = append(openFiles, o.URI())
 		}
 		// Sort for determinism.
-		sort.Slice(openFiles, func(i, j int) bool {
-			return openFiles[i] < openFiles[j]
-		})
+		slices.Sort(openFiles)
 
 		// TODO(rfindley): can we avoid running the go command (go env)
 		// synchronously to change processing? Can we assume that the env did not
@@ -870,9 +889,10 @@ func (s *Session) DidModifyFiles(ctx context.Context, modifications []file.Modif
 	for _, mod := range modifications {
 		v, err := s.viewOfLocked(ctx, mod.URI)
 		if err != nil {
-			// bestViewForURI only returns an error in the event of context
-			// cancellation. Since state changes should occur on an uncancellable
-			// context, an error here is a bug.
+			// viewOfLocked only returns an error in the event of context
+			// cancellation, or if the session is shut down. Since state changes
+			// should occur on an uncancellable context, and s.viewMap was checked at
+			// the top of this function, an error here is a bug.
 			bug.Reportf("finding best view for change: %v", err)
 			continue
 		}
@@ -1105,9 +1125,7 @@ func (s *Session) FileWatchingGlobPatterns(ctx context.Context) map[protocol.Rel
 		if err != nil {
 			continue // view is shut down; continue with others
 		}
-		for k, v := range snapshot.fileWatchingGlobPatterns() {
-			patterns[k] = v
-		}
+		maps.Copy(patterns, snapshot.fileWatchingGlobPatterns())
 		release()
 	}
 	return patterns
@@ -1121,6 +1139,11 @@ func (s *Session) FileWatchingGlobPatterns(ctx context.Context) map[protocol.Rel
 //
 // The caller must not mutate the result.
 func (s *Session) OrphanedFileDiagnostics(ctx context.Context) (map[protocol.DocumentURI][]*Diagnostic, error) {
+	if err := ctx.Err(); err != nil {
+		// Avoid collecting diagnostics if the context is cancelled.
+		// (Previously, it was possible to get all the way to packages.Load on a cancelled context)
+		return nil, err
+	}
 	// Note: diagnostics holds a slice for consistency with other diagnostic
 	// funcs.
 	diagnostics := make(map[protocol.DocumentURI][]*Diagnostic)
